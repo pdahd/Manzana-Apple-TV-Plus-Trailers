@@ -4,7 +4,7 @@ from core import run
 
 install()
 
-VERSION = '2.2.0'
+VERSION = '2.3.0'
 LOGO = r"""
 
 
@@ -30,6 +30,46 @@ def main():
         version=f"Manzana: Apple TV Plus Trailers {VERSION}",
         action="version"
     )
+
+    # Trailer selection
+    parser.add_argument(
+        '--list-trailers',
+        dest="listTrailers",
+        help="list available trailers (t0, t1, ...) and exit",
+        action="store_true"
+    )
+    parser.add_argument(
+        '--trailer',
+        dest="trailer",
+        help='select trailer by id (e.g. t0, t1) or "all". If not provided, will prompt in TTY unless --no-prompt.',
+        type=str,
+        default=None
+    )
+
+    # Format listing / selection (yt-dlp style)
+    parser.add_argument(
+        '-F',
+        '--list-formats',
+        dest="listFormats",
+        help="list available video/audio/subtitle streams and exit",
+        action="store_true"
+    )
+    parser.add_argument(
+        '-f',
+        '--format',
+        dest="format",
+        help='format selector, e.g. "v0+a1+s0" (use -F to see ids)',
+        type=str,
+        default=None
+    )
+    parser.add_argument(
+        '--no-prompt',
+        dest="noPrompt",
+        help="disable any interactive prompts (CI/Actions friendly)",
+        action="store_true"
+    )
+
+    # Existing options
     parser.add_argument(
         '-d',
         '--default',
@@ -51,6 +91,7 @@ def main():
         help="don't download subtitle streams. (default: False)",
         action="store_true"
     )
+
     parser.add_argument(
         'url',
         help="AppleTV+ URL for a movie or a tv-show.",
