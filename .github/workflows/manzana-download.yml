@@ -1,9 +1,11 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.2.0
+# .github/workflows/manzana-download.yml @ v1.4.0
 # Phase-1: list formats (-F) and upload formats.txt
 # Phase-2: download only when "format" input is non-empty
-# New in v1.2.0: generate post-mux inspection reports (ffprobe + MP4Box)
+# New in v1.4.0:
+#   - Cache FFmpeg/ffprobe via BtbN prebuilt binaries (actions/cache)
+#   - Install only gpac (MP4Box) via apt in Phase-2 (no apt ffmpeg)
 
 on:
   workflow_dispatch:
@@ -59,11 +61,40 @@ jobs:
           path: formats.txt
           if-no-files-found: error
 
-      - name: Install system deps (gpac/ffmpeg) [Phase 2 only]
+      # -------- Phase 2 only (when format is provided) --------
+
+      - name: Cache FFmpeg (BtbN)
+        if: ${{ inputs.format != '' }}
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/ffmpeg-btbn
+          key: ffmpeg-btbn-master-latest-linux64-gpl-v1
+
+      - name: Install FFmpeg (BtbN Daily Build)
+        if: ${{ inputs.format != '' && steps.cache-ffmpeg.outputs.cache-hit != 'true' }}
+        run: |
+          mkdir -p ~/.local/ffmpeg-btbn
+          wget -O /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xf /tmp/ffmpeg.tar.xz -C ~/.local/ffmpeg-btbn --strip-components=1
+          ls -la ~/.local/ffmpeg-btbn/bin || true
+
+      - name: Add FFmpeg to PATH
+        if: ${{ inputs.format != '' }}
+        run: |
+          echo "$HOME/.local/ffmpeg-btbn/bin" >> $GITHUB_PATH
+          which ffmpeg
+          ffmpeg -version | head -n 3
+          which ffprobe
+          ffprobe -version | head -n 3
+
+      - name: Install MP4Box (gpac) [Phase 2 only]
         if: ${{ inputs.format != '' }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y gpac ffmpeg
+          sudo apt-get install -y gpac
+          which MP4Box
+          MP4Box -version || true
 
       - name: Phase 2 - Download (skip if format is empty)
         if: ${{ inputs.format != '' }}
@@ -76,7 +107,7 @@ jobs:
             python manzana.py --no-prompt --trailer "${{ inputs.trailer }}" -f "${{ inputs.format }}" "${{ inputs.url }}"
           fi
 
-      - name: Inspect output media info (ffprobe + MP4Box)
+      - name: Inspect output media info (ffprobe JSON only)
         if: ${{ inputs.format != '' }}
         run: |
           mkdir -p report
@@ -91,13 +122,9 @@ jobs:
             base="$(basename "$f")"
             echo "=== Inspecting: $base ==="
 
-            # ffprobe JSON (streams + format + tags)
             ffprobe -hide_banner -v error \
               -show_format -show_streams \
               -print_format json "$f" > "report/${base}.ffprobe.json"
-
-            # MP4Box info (track list etc.)
-            MP4Box -info "$f" > "report/${base}.mp4box.txt" || true
           done
 
       - name: Upload inspection report as artifact (manzana-report)
