@@ -1,5 +1,10 @@
 name: Manzana Download (Apple TV+ Trailers)
 
+# .github/workflows/manzana-download.yml @ v1.2.0
+# Phase-1: list formats (-F) and upload formats.txt
+# Phase-2: download only when "format" input is non-empty
+# New in v1.2.0: generate post-mux inspection reports (ffprobe + MP4Box)
+
 on:
   workflow_dispatch:
     inputs:
@@ -8,12 +13,12 @@ on:
         required: true
         type: string
       trailer:
-        description: 'Trailer id: t0 / t1 / all'
+        description: "Trailer id: t0 / t1 / all"
         required: false
         default: "t0"
         type: string
       format:
-        description: '可选：v0+a0+s0（先看 -F 输出再填）。留空=只列格式不下载'
+        description: 'Optional. Format IDs like v0+a0+s4 (NOT "-F"). Leave empty to only list formats.'
         required: false
         default: ""
         type: string
@@ -43,24 +48,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Show formats (-F) and save to formats.txt
+      - name: Phase 1 - List formats (-F) and save to formats.txt
         run: |
           python manzana.py --no-prompt --trailer "${{ inputs.trailer }}" -F "${{ inputs.url }}" | tee formats.txt
 
-      - name: Upload formats as artifact
+      - name: Upload formats as artifact (manzana-formats)
         uses: actions/upload-artifact@v4
         with:
           name: manzana-formats
           path: formats.txt
           if-no-files-found: error
 
-      - name: Install system deps (gpac/ffmpeg) [download only]
+      - name: Install system deps (gpac/ffmpeg) [Phase 2 only]
         if: ${{ inputs.format != '' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y gpac ffmpeg
 
-      - name: Download [skip if format is empty]
+      - name: Phase 2 - Download (skip if format is empty)
         if: ${{ inputs.format != '' }}
         env:
           PYTHONUNBUFFERED: "1"
@@ -71,7 +76,39 @@ jobs:
             python manzana.py --no-prompt --trailer "${{ inputs.trailer }}" -f "${{ inputs.format }}" "${{ inputs.url }}"
           fi
 
-      - name: Upload output as artifact
+      - name: Inspect output media info (ffprobe + MP4Box)
+        if: ${{ inputs.format != '' }}
+        run: |
+          mkdir -p report
+          shopt -s nullglob
+          files=(output/*.mp4)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No mp4 found in output/"
+            exit 1
+          fi
+
+          for f in "${files[@]}"; do
+            base="$(basename "$f")"
+            echo "=== Inspecting: $base ==="
+
+            # ffprobe JSON (streams + format + tags)
+            ffprobe -hide_banner -v error \
+              -show_format -show_streams \
+              -print_format json "$f" > "report/${base}.ffprobe.json"
+
+            # MP4Box info (track list etc.)
+            MP4Box -info "$f" > "report/${base}.mp4box.txt" || true
+          done
+
+      - name: Upload inspection report as artifact (manzana-report)
+        if: ${{ inputs.format != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: manzana-report
+          path: report/
+          if-no-files-found: error
+
+      - name: Upload output as artifact (manzana-output)
         if: ${{ inputs.format != '' }}
         uses: actions/upload-artifact@v4
         with:
