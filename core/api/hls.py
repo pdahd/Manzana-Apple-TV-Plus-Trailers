@@ -27,18 +27,20 @@ def get_hls(url):
             if previousUriPath == currentUriPath:
                 continue
 
-        Codec = v.stream_info.codecs
-        VideoRange = v.stream_info.video_range
+        Codec = v.stream_info.codecs or ""
+        VideoRange = v.stream_info.video_range or "SDR"
 
-        if 'PQ' in VideoRange:
+        if 'PQ' in str(VideoRange):
             VideoRange = 'HDR'
-        if 'avc' in Codec:
+        if 'avc' in str(Codec):
             Codec = 'AVC'
-        if 'hvc' in Codec:
+        if 'hvc' in str(Codec):
             Codec = 'HEVC'
-        if 'dvh' in Codec:
+        if 'dvh' in str(Codec):
             Codec = 'HEVC'
             VideoRange = 'DoVi'
+
+        avg_bw = getattr(v.stream_info, "average_bandwidth", None) or 0
 
         dataListVideo.append(
             {
@@ -47,7 +49,8 @@ def get_hls(url):
                 'fps': v.stream_info.frame_rate,
                 'codec': Codec,
                 'resolution': v.stream_info.resolution,
-                'bitrate': f'{round((v.stream_info.average_bandwidth)/1000000, 2)} Mb/s',
+                'bandwidth': int(avg_bw),
+                'bitrate': f'{round((avg_bw)/1000000, 2)} Mb/s' if avg_bw else 'Null',
                 'uri': v.uri
             }
         )
@@ -62,10 +65,10 @@ def get_hls(url):
 
                 if previousUriPath == currentUriPath:
                     continue
-                
+
             isAD = False
             isOriginal = False
-            
+
             c = m.characteristics
             if c:
                 if "original-content" in c:
@@ -73,8 +76,8 @@ def get_hls(url):
                 if "accessibility" in c:
                     isAD = True
 
-            g = m.group_id
-            
+            g = m.group_id or ""
+
             if "atmos" in g:
                 Codec = "Atmos"
             elif "ac3" in g:
@@ -82,20 +85,24 @@ def get_hls(url):
             elif "stereo" in g:
                 if "HE" in g:
                     Codec = "HE-AAC"
-                else: Codec = "AAC"
+                else:
+                    Codec = "AAC"
+            else:
+                Codec = "Unknown"
 
             b = "Null"
 
-            if "gr32" in m.uri:
-                b = '32 Kb/s'
-            elif "gr64" in m.uri:
-                b = '64 Kb/s'
-            elif "gr160" in m.uri:
-                b = '160 Kb/s'
-            elif "gr384" in m.uri:
-                b = '384 Kb/s'
-            elif "gr2448" in m.uri:
-                b = '488 Kb/s'
+            if m.uri:
+                if "gr32" in m.uri:
+                    b = '32 Kb/s'
+                elif "gr64" in m.uri:
+                    b = '64 Kb/s'
+                elif "gr160" in m.uri:
+                    b = '160 Kb/s'
+                elif "gr384" in m.uri:
+                    b = '384 Kb/s'
+                elif "gr2448" in m.uri:
+                    b = '488 Kb/s'
 
             dataListAudio.append(
                 {
