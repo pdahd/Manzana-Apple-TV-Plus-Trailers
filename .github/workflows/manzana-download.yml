@@ -1,11 +1,11 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.4.2
+# .github/workflows/manzana-download.yml @ v1.4.3
 # - Phase-1: list formats (-F) and upload formats.txt
 # - Phase-2: download only when "format" input is non-empty
 # - Cache FFmpeg/ffprobe via BtbN prebuilt binaries (actions/cache)
 # - Install only gpac (MP4Box) via apt in Phase-2 (no apt ffmpeg)
-# - Inspect: print ffprobe summary to log + upload full JSON as artifact
+# - Inspect: print ffprobe summary (with per-stream bit_rate) + upload JSON
 
 on:
   workflow_dispatch:
@@ -129,13 +129,12 @@ jobs:
             echo "--- FORMAT (container) ---"
             ffprobe -hide_banner -v error \
               -show_entries format=filename,format_name,duration,size,bit_rate \
-              -of default=nw=1 "$f" || true
+              -of default=nw=1 "$f"
 
-            echo "--- STREAMS (tracks) ---"
-            # One line per stream, easy to read in Actions log
+            echo "--- STREAMS (tracks, includes bit_rate when available) ---"
             ffprobe -hide_banner -v error \
-              -show_entries stream=index,codec_type,codec_name,profile,width,height,r_frame_rate,avg_frame_rate,pix_fmt,color_space,color_transfer,color_primaries,channels,channel_layout,sample_rate:stream_tags=language,title \
-              -of compact=p=0:nk=1 "$f" || true
+              -show_entries stream=index,codec_type,codec_name,profile,bit_rate,width,height,avg_frame_rate,channels,channel_layout,sample_rate:stream_tags=language,title \
+              -of default=nw=1 "$f"
 
             echo "--- JSON (artifact) ---"
             ffprobe -hide_banner -v error \
