@@ -1,11 +1,7 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.4.0
-# Phase-1: list formats (-F) and upload formats.txt
-# Phase-2: download only when "format" input is non-empty
-# New in v1.4.0:
-#   - Cache FFmpeg/ffprobe via BtbN prebuilt binaries (actions/cache)
-#   - Install only gpac (MP4Box) via apt in Phase-2 (no apt ffmpeg)
+# .github/workflows/manzana-download.yml @ v1.4.1
+# Fix: $GITHUB_PATH only affects subsequent steps; verify ffmpeg in a separate step.
 
 on:
   workflow_dispatch:
@@ -83,9 +79,13 @@ jobs:
         if: ${{ inputs.format != '' }}
         run: |
           echo "$HOME/.local/ffmpeg-btbn/bin" >> $GITHUB_PATH
-          which ffmpeg
+
+      - name: Verify FFmpeg in PATH
+        if: ${{ inputs.format != '' }}
+        run: |
+          command -v ffmpeg
           ffmpeg -version | head -n 3
-          which ffprobe
+          command -v ffprobe
           ffprobe -version | head -n 3
 
       - name: Install MP4Box (gpac) [Phase 2 only]
@@ -93,7 +93,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gpac
-          which MP4Box
+          command -v MP4Box
           MP4Box -version || true
 
       - name: Phase 2 - Download (skip if format is empty)
