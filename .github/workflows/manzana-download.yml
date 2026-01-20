@@ -1,8 +1,7 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.4.4
-# - Improve trailer input description (avoid user confusion)
-# - Add trailer input validation step (t<number> or all/a)
+# .github/workflows/manzana-download.yml @ v1.4.5
+# - Move Validate inputs step before Checkout to fail fast
 # - Keep everything else unchanged
 
 on:
@@ -34,20 +33,6 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install python deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
       - name: Validate inputs
         run: |
           set -euo pipefail
@@ -66,6 +51,20 @@ jobs:
             echo "Do NOT input: 't0 / t1 / all' or any text with spaces/slashes."
             exit 1
           fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Phase 1 - List formats (-F) and save to formats.txt
         run: |
