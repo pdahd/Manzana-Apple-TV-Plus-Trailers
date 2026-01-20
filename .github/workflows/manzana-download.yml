@@ -1,11 +1,14 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.5.1
-# Fix in v1.5.1:
-# - Preset selector output capture is now robust:
-#   - tools/select_format.py @ v0.1.1 redirects Manzana logs to stderr (stdout is clean)
-#   - Still, we defensively capture ONLY the last stdout line and strip CR/LF before writing to $GITHUB_ENV
-# - Everything else remains the same as v1.5.0
+# .github/workflows/manzana-download.yml @ v1.6.0
+# Enhancements:
+# - Preset modes now support trailer=all (fail_fast=false):
+#   - Compute formats per-trailer (t0..tN-1) using tools/select_format.py
+#   - Download each trailer, continue on failures
+#   - Summarize failures as ::warning::
+#   - If ALL downloads fail -> exit 1
+# - Uses tools/list_trailers.py to get trailer count (stdout clean)
+# - Keeps: Phase-1 list formats, default_only applied to -F, ffmpeg cache, ffprobe inspect, artifacts
 
 on:
   workflow_dispatch:
@@ -15,16 +18,14 @@ on:
         required: true
         type: string
 
-      # We keep trailer/default_only available for all modes (more flexible).
-      # Note: preset modes v0.1.x do NOT support trailer=all (selector limitation).
       trailer:
-        description: 'Trailer selector: use t0, t1, t2... (e.g. "t0"). NOTE: preset modes do NOT support "all" (use custom mode if you need all).'
+        description: 'Trailer selector: use t0, t1, t2... (e.g. "t0") or "all". In preset modes, "all" will apply presets to each trailer (t0..tN-1).'
         required: false
         default: "t0"
         type: string
 
       default_only:
-        description: "Use --default (only default trailer metadata). Recommended if you only want the page's default/main video."
+        description: "Use --default (only default trailer metadata). If enabled, the page usually has a single default video (trailer=all behaves like t0)."
         required: false
         default: false
         type: boolean
@@ -138,7 +139,7 @@ jobs:
 
           # ---- trailer validation ----
           if [[ -z "$TRAILER" ]]; then
-            echo "::error::Input 'trailer' is empty. Use t0, t1, t2..."
+            echo "::error::Input 'trailer' is empty. Use t0, t1, t2... or all."
             exit 1
           fi
 
@@ -149,13 +150,6 @@ jobs:
             echo "::error::Invalid trailer input: '$TRAILER'"
             echo "Expected: t0, t1, t2... (t + digits) OR 'all' (or 'a')."
             echo "Do NOT input spaces/slashes, e.g. 't0 / t1 / all'."
-            exit 1
-          fi
-
-          # preset modes do NOT support trailer=all in selector v0.1.x
-          if [[ "$MODE" != "custom" ]] && [[ "$TRAILER" =~ ^(all|a)$ ]]; then
-            echo "::error::In preset modes (preset_av/preset_video), trailer=all is not supported (selector v0.1.x)."
-            echo "Please use trailer=t0/t1/... OR switch mode=custom if you need trailer=all."
             exit 1
           fi
 
@@ -242,7 +236,7 @@ jobs:
           path: formats.txt
           if-no-files-found: error
 
-      - name: Compute EFFECTIVE_FORMAT (preset/custom)
+      - name: Compute EFFECTIVE_FORMAT / PLAN (preset/custom)
         run: |
           set -euo pipefail
 
@@ -251,25 +245,28 @@ jobs:
           TRAILER="${{ inputs.trailer }}"
           DEFAULT_ONLY="${{ inputs.default_only }}"
 
-          # default flag for selector
           DEFAULT_FLAG=""
           if [[ "$DEFAULT_ONLY" == "true" ]]; then
             DEFAULT_FLAG="--default-only"
           fi
 
+          PLAN_FILE="$RUNNER_TEMP/manzana_plan.txt"
+          : > "$PLAN_FILE"
+
+          echo "FORMAT_PLAN_FILE=$PLAN_FILE" >> "$GITHUB_ENV"
+
           if [[ "$MODE" == "custom" ]]; then
-            # Use user-provided format as-is (may be empty)
             F="${{ inputs.format }}"
-            # Strip wrapping quotes if pasted
             if [[ ${#F} -ge 2 ]]; then
               if [[ ( "${F:0:1}" == "\"" && "${F: -1}" == "\"" ) || ( "${F:0:1}" == "'" && "${F: -1}" == "'" ) ]]; then
                 F="${F:1:-1}"
               fi
             fi
-            # strip CR/LF just in case
             F="$(printf "%s" "$F" | tr -d '\r\n')"
 
             echo "EFFECTIVE_FORMAT=$F" >> "$GITHUB_ENV"
+            echo "DOWNLOAD_ALL=false" >> "$GITHUB_ENV"
+
             if [[ -z "$F" ]]; then
               echo "DO_DOWNLOAD=false" >> "$GITHUB_ENV"
               echo "mode=custom: format empty -> list only, no download."
@@ -278,37 +275,114 @@ jobs:
               echo "mode=custom: will download with format: $F"
             fi
 
-          elif [[ "$MODE" == "preset_av" ]]; then
-            # Compute format using selector (stdout should be only the format string)
-            EFF="$(python tools/select_format.py \
-              --url "$URL" \
-              --trailer "$TRAILER" \
-              $DEFAULT_FLAG \
-              --mode preset_av \
-              --preset-av-profile "${{ inputs.preset_av_profile }}" \
-              --audio-lang "${{ inputs.audio_lang }}" \
-              --sub-lang "${{ inputs.sub_lang }}" \
-            | tail -n 1 | tr -d '\r\n')"
-
-            echo "EFFECTIVE_FORMAT=$EFF" >> "$GITHUB_ENV"
+          elif [[ "$MODE" == "preset_av" || "$MODE" == "preset_video" ]]; then
+            # preset modes always download (unless all trailers fail in plan or selection step)
             echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
-            echo "mode=preset_av: computed format: $EFF"
 
-          elif [[ "$MODE" == "preset_video" ]]; then
-            EFF="$(python tools/select_format.py \
-              --url "$URL" \
-              --trailer "$TRAILER" \
-              $DEFAULT_FLAG \
-              --mode preset_video \
-              --preset-video-profile "${{ inputs.preset_video_profile }}" \
-              --audio-quality "${{ inputs.audio_quality }}" \
-              --audio-lang "${{ inputs.audio_lang }}" \
-              --sub-lang "${{ inputs.sub_lang }}" \
-            | tail -n 1 | tr -d '\r\n')"
+            # Expand trailer=all/a into t0..tN-1 plan
+            if [[ "$TRAILER" =~ ^(all|a)$ ]]; then
+              COUNT="$(python tools/list_trailers.py --url "$URL" $DEFAULT_FLAG | tail -n 1 | tr -d '\r\n')"
+              if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
+                echo "::error::Unable to parse trailer count: '$COUNT'"
+                exit 1
+              fi
 
-            echo "EFFECTIVE_FORMAT=$EFF" >> "$GITHUB_ENV"
-            echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
-            echo "mode=preset_video: computed format: $EFF"
+              if [[ "$COUNT" -le 0 ]]; then
+                echo "::error::No trailers found."
+                exit 1
+              fi
+
+              echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
+              echo "::notice::preset mode + trailer=all -> computing plan for $COUNT trailers (t0..t$((COUNT-1)))."
+
+              sel_failed=()
+
+              for ((i=0;i<COUNT;i++)); do
+                TID="t${i}"
+
+                set +e
+                if [[ "$MODE" == "preset_av" ]]; then
+                  EFF="$(python tools/select_format.py \
+                    --url "$URL" \
+                    --trailer "$TID" \
+                    $DEFAULT_FLAG \
+                    --mode preset_av \
+                    --preset-av-profile "${{ inputs.preset_av_profile }}" \
+                    --audio-lang "${{ inputs.audio_lang }}" \
+                    --sub-lang "${{ inputs.sub_lang }}" \
+                  | tail -n 1 | tr -d '\r\n')"
+                else
+                  EFF="$(python tools/select_format.py \
+                    --url "$URL" \
+                    --trailer "$TID" \
+                    $DEFAULT_FLAG \
+                    --mode preset_video \
+                    --preset-video-profile "${{ inputs.preset_video_profile }}" \
+                    --audio-quality "${{ inputs.audio_quality }}" \
+                    --audio-lang "${{ inputs.audio_lang }}" \
+                    --sub-lang "${{ inputs.sub_lang }}" \
+                  | tail -n 1 | tr -d '\r\n')"
+                fi
+                RC=$?
+                set -e
+
+                if [[ $RC -ne 0 || -z "$EFF" ]]; then
+                  sel_failed+=("$TID")
+                  echo "::warning::Selector failed for $TID (skipping)."
+                  continue
+                fi
+
+                echo "$TID $EFF" >> "$PLAN_FILE"
+              done
+
+              if [[ ! -s "$PLAN_FILE" ]]; then
+                echo "::error::All trailers failed during selection (no plan entries)."
+                exit 1
+              fi
+
+              echo "::notice::Computed plan (trailer -> format):"
+              cat "$PLAN_FILE"
+
+              if [[ ${#sel_failed[@]} -gt 0 ]]; then
+                echo "::warning::Selector failed for trailers: ${sel_failed[*]}"
+              fi
+
+            else
+              # Single trailer preset selection
+              echo "DOWNLOAD_ALL=false" >> "$GITHUB_ENV"
+
+              if [[ "$MODE" == "preset_av" ]]; then
+                EFF="$(python tools/select_format.py \
+                  --url "$URL" \
+                  --trailer "$TRAILER" \
+                  $DEFAULT_FLAG \
+                  --mode preset_av \
+                  --preset-av-profile "${{ inputs.preset_av_profile }}" \
+                  --audio-lang "${{ inputs.audio_lang }}" \
+                  --sub-lang "${{ inputs.sub_lang }}" \
+                | tail -n 1 | tr -d '\r\n')"
+              else
+                EFF="$(python tools/select_format.py \
+                  --url "$URL" \
+                  --trailer "$TRAILER" \
+                  $DEFAULT_FLAG \
+                  --mode preset_video \
+                  --preset-video-profile "${{ inputs.preset_video_profile }}" \
+                  --audio-quality "${{ inputs.audio_quality }}" \
+                  --audio-lang "${{ inputs.audio_lang }}" \
+                  --sub-lang "${{ inputs.sub_lang }}" \
+                | tail -n 1 | tr -d '\r\n')"
+              fi
+
+              if [[ -z "$EFF" ]]; then
+                echo "::error::Selector returned empty effective format."
+                exit 1
+              fi
+
+              echo "EFFECTIVE_FORMAT=$EFF" >> "$GITHUB_ENV"
+              echo "::notice::preset mode -> computed format: $EFF"
+            fi
+
           else
             echo "::error::Unknown mode '$MODE'"
             exit 1
@@ -353,16 +427,78 @@ jobs:
           command -v MP4Box
           MP4Box -version || true
 
-      - name: Phase 2 - Download (uses EFFECTIVE_FORMAT)
+      - name: Phase 2 - Download (custom single / preset single / preset all)
         if: ${{ env.DO_DOWNLOAD == 'true' }}
         env:
           PYTHONUNBUFFERED: "1"
         run: |
-          echo "Using EFFECTIVE_FORMAT=${EFFECTIVE_FORMAT}"
-          if [ "${{ inputs.default_only }}" = "true" ]; then
-            python manzana.py --default --no-prompt --trailer "${{ inputs.trailer }}" -f "${EFFECTIVE_FORMAT}" "${{ inputs.url }}"
+          set -euo pipefail
+
+          URL="${{ inputs.url }}"
+          DEFAULT_ONLY="${{ inputs.default_only }}"
+          TRAILER="${{ inputs.trailer }}"
+          MODE="${{ inputs.mode }}"
+          DOWNLOAD_ALL="${{ env.DOWNLOAD_ALL }}"
+          PLAN_FILE="${{ env.FORMAT_PLAN_FILE }}"
+          EFF="${{ env.EFFECTIVE_FORMAT }}"
+
+          default_args=()
+          if [[ "$DEFAULT_ONLY" == "true" ]]; then
+            default_args+=(--default)
+          fi
+
+          failures=()
+          success_count=0
+
+          if [[ "$MODE" == "custom" ]]; then
+            # single call (Manzana handles trailer=all itself, may fail if IDs mismatch across trailers)
+            echo "Using custom EFFECTIVE_FORMAT=$EFF"
+            python manzana.py "${default_args[@]}" --no-prompt --trailer "$TRAILER" -f "$EFF" "$URL"
+            success_count=1
+
           else
-            python manzana.py --no-prompt --trailer "${{ inputs.trailer }}" -f "${EFFECTIVE_FORMAT}" "${{ inputs.url }}"
+            if [[ "$DOWNLOAD_ALL" == "true" ]]; then
+              if [[ ! -s "$PLAN_FILE" ]]; then
+                echo "::error::Plan file missing or empty: $PLAN_FILE"
+                exit 1
+              fi
+
+              echo "::notice::Downloading multiple trailers (continue on failures)."
+
+              while read -r tid fmt; do
+                if [[ -z "$tid" || -z "$fmt" ]]; then
+                  continue
+                fi
+
+                echo "::notice::Downloading $tid with format=$fmt"
+                set +e
+                python manzana.py "${default_args[@]}" --no-prompt --trailer "$tid" -f "$fmt" "$URL"
+                rc=$?
+                set -e
+
+                if [[ $rc -ne 0 ]]; then
+                  failures+=("$tid")
+                  echo "::warning::Download failed for $tid (rc=$rc). Continuing..."
+                else
+                  ((success_count+=1))
+                fi
+              done < "$PLAN_FILE"
+
+            else
+              # preset single trailer
+              echo "::notice::Downloading single trailer $TRAILER with format=$EFF"
+              python manzana.py "${default_args[@]}" --no-prompt --trailer "$TRAILER" -f "$EFF" "$URL"
+              success_count=1
+            fi
+          fi
+
+          if [[ $success_count -le 0 ]]; then
+            echo "::error::All downloads failed (no successful outputs)."
+            exit 1
+          fi
+
+          if [[ ${#failures[@]} -gt 0 ]]; then
+            echo "::warning::Some trailers failed to download: ${failures[*]}"
           fi
 
       - name: Inspect output media info (ffprobe summary + JSON)
