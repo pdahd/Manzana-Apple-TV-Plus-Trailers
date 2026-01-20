@@ -1,11 +1,11 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.5.0
-# Major update:
-# - Add mode switch: preset_av / preset_video / custom
-# - Add preset profiles and audio/sub menus (audio_quality includes 'none' for video-only file)
-# - Use tools/select_format.py to compute EFFECTIVE_FORMAT in preset modes
-# - Keep: fail-fast validation, Phase-1 list formats, default_only applied to -F, ffmpeg cache, ffprobe inspect, artifacts
+# .github/workflows/manzana-download.yml @ v1.5.1
+# Fix in v1.5.1:
+# - Preset selector output capture is now robust:
+#   - tools/select_format.py @ v0.1.1 redirects Manzana logs to stderr (stdout is clean)
+#   - Still, we defensively capture ONLY the last stdout line and strip CR/LF before writing to $GITHUB_ENV
+# - Everything else remains the same as v1.5.0
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ on:
         type: string
 
       # We keep trailer/default_only available for all modes (more flexible).
-      # Note: preset modes v0.1.0 do NOT support trailer=all (selector limitation).
+      # Note: preset modes v0.1.x do NOT support trailer=all (selector limitation).
       trailer:
         description: 'Trailer selector: use t0, t1, t2... (e.g. "t0"). NOTE: preset modes do NOT support "all" (use custom mode if you need all).'
         required: false
@@ -152,9 +152,9 @@ jobs:
             exit 1
           fi
 
-          # preset modes do NOT support trailer=all in selector v0.1.0
+          # preset modes do NOT support trailer=all in selector v0.1.x
           if [[ "$MODE" != "custom" ]] && [[ "$TRAILER" =~ ^(all|a)$ ]]; then
-            echo "::error::In preset modes (preset_av/preset_video), trailer=all is not supported (selector v0.1.0)."
+            echo "::error::In preset modes (preset_av/preset_video), trailer=all is not supported (selector v0.1.x)."
             echo "Please use trailer=t0/t1/... OR switch mode=custom if you need trailer=all."
             exit 1
           fi
@@ -266,6 +266,8 @@ jobs:
                 F="${F:1:-1}"
               fi
             fi
+            # strip CR/LF just in case
+            F="$(printf "%s" "$F" | tr -d '\r\n')"
 
             echo "EFFECTIVE_FORMAT=$F" >> "$GITHUB_ENV"
             if [[ -z "$F" ]]; then
@@ -275,8 +277,9 @@ jobs:
               echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
               echo "mode=custom: will download with format: $F"
             fi
+
           elif [[ "$MODE" == "preset_av" ]]; then
-            # Compute format using selector
+            # Compute format using selector (stdout should be only the format string)
             EFF="$(python tools/select_format.py \
               --url "$URL" \
               --trailer "$TRAILER" \
@@ -285,10 +288,12 @@ jobs:
               --preset-av-profile "${{ inputs.preset_av_profile }}" \
               --audio-lang "${{ inputs.audio_lang }}" \
               --sub-lang "${{ inputs.sub_lang }}" \
-            )"
+            | tail -n 1 | tr -d '\r\n')"
+
             echo "EFFECTIVE_FORMAT=$EFF" >> "$GITHUB_ENV"
             echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
             echo "mode=preset_av: computed format: $EFF"
+
           elif [[ "$MODE" == "preset_video" ]]; then
             EFF="$(python tools/select_format.py \
               --url "$URL" \
@@ -299,7 +304,8 @@ jobs:
               --audio-quality "${{ inputs.audio_quality }}" \
               --audio-lang "${{ inputs.audio_lang }}" \
               --sub-lang "${{ inputs.sub_lang }}" \
-            )"
+            | tail -n 1 | tr -d '\r\n')"
+
             echo "EFFECTIVE_FORMAT=$EFF" >> "$GITHUB_ENV"
             echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
             echo "mode=preset_video: computed format: $EFF"
