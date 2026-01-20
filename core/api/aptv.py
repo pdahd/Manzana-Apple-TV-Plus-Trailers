@@ -4,7 +4,6 @@ import datetime
 import warnings
 
 from bs4 import BeautifulSoup
-from urllib.parse import unquote
 from urllib.parse import urlparse
 
 from utils import logger
@@ -28,7 +27,7 @@ class AppleTVPlus:
 
     def __get_access_token(self):
         logger.info("Fetching access-token from web...")
-        
+
         try:
             r = requests.get("https://tv.apple.com/us")
         except:
@@ -63,17 +62,17 @@ class AppleTVPlus:
                 except:
                     logger.warning("SSL failed! Trying without SSL...")
                     r = requests.get(url, verify=False)
-                
+
                 if r.status_code == 200:
                     return True
             except:
                 return False
-            
+
         u = urlparse(url)
-        
+
         if not u.scheme:
             url = f"https://{url}"
-        
+
         if u.netloc == "tv.apple.com":
             if check(url):
                 s = u.path.split('/')
@@ -88,8 +87,10 @@ class AppleTVPlus:
                         self.id = u.query.replace('showId=', '')
                     else:
                         logger.error("Unable to parse showId from URL!", 1)
-            else: logger.error("URL is invalid! Please check the URL!", 1)
-        else: logger.error("URL is invalid! Host should be tv.apple.com!", 1)
+            else:
+                logger.error("URL is invalid! Please check the URL!", 1)
+        else:
+            logger.error("URL is invalid! Host should be tv.apple.com!", 1)
 
     def __get_json(self):
         logger.info("Fetching API response...")
@@ -104,20 +105,22 @@ class AppleTVPlus:
             "utsk": "6e3013c6d6fae3c2::::::235656c069bb0efb",
             "v": "68"
         }
-        
+
+        # IMPORTANT: use self.session so the developerToken header is included
         try:
-            r = requests.get(url=apiUrl, params=params)
+            r = self.session.get(url=apiUrl, params=params)
         except:
             logger.warning("SSL failed! Trying without SSL...")
-            r = requests.get(url=apiUrl, params=params, verify=False)
+            r = self.session.get(url=apiUrl, params=params, verify=False)
 
         return json.loads(r.text)
-    
+
     def __get_default(self):
         def genres(genre):
-            if not isinstance(genre, list): genre = [genre]
+            if not isinstance(genre, list):
+                genre = [genre]
             return [g["name"] for g in genre]
-        
+
         def fixdate(date):
             return datetime.datetime.utcfromtimestamp(date/1000.0).strftime('%Y-%m-%d')
 
@@ -141,20 +144,23 @@ class AppleTVPlus:
             "description": data["data"]["content"]["description"],
             "genres": genres(data["data"]["content"]["genres"])
         }
-    
+
     def __get_trailers(self):
         def genres(genre):
-            if not isinstance(genre, list): genre = [genre]
+            if not isinstance(genre, list):
+                genre = [genre]
             return [g["name"] for g in genre]
-        
+
         def fixdate(date):
             return datetime.datetime.utcfromtimestamp(date/1000.0).strftime('%Y-%m-%d')
-        
+
         data = self.__get_json()
 
         backgroundVideos = next(
-            (shelve["items"] for shelve in data["data"]["canvas"]["shelves"] if shelve.get("title") == "Trailers"), None)
-        
+            (shelve["items"] for shelve in data["data"]["canvas"]["shelves"] if shelve.get("title") == "Trailers"),
+            None
+        )
+
         dataList = []
 
         if backgroundVideos:
@@ -179,11 +185,11 @@ class AppleTVPlus:
                         "genres": genres(data["data"]["content"]["genres"])
                     }
                 )
-            
+
             return dataList
         else:
             return [self.__get_default()]
-    
+
     def get_info(self, url, default):
         self.__get_url(url)
 

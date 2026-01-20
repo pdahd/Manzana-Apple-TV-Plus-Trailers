@@ -1,5 +1,12 @@
 name: Manzana Download (Apple TV+ Trailers)
 
+# .github/workflows/manzana-download.yml @ v1.4.3
+# - Phase-1: list formats (-F) and upload formats.txt
+# - Phase-2: download only when "format" input is non-empty
+# - Cache FFmpeg/ffprobe via BtbN prebuilt binaries (actions/cache)
+# - Install only gpac (MP4Box) via apt in Phase-2 (no apt ffmpeg)
+# - Inspect: print ffprobe summary (with per-stream bit_rate) + upload JSON
+
 on:
   workflow_dispatch:
     inputs:
@@ -8,13 +15,14 @@ on:
         required: true
         type: string
       trailer:
-        description: 'Trailer id: t0 / t1 / all (建议先用 --list-trailers 或 -F 在日志里确认)'
+        description: "Trailer id: t0 / t1 / all"
         required: false
         default: "t0"
         type: string
       format:
-        description: 'Format selector e.g. v0+a0+s0 (先用 -F 查看可用 ID)'
-        required: true
+        description: 'Optional. Format IDs like v0+a0+s4 (NOT "-F"). Leave empty to only list formats.'
+        required: false
+        default: ""
         type: string
       default_only:
         description: "Use --default (only default trailer metadata)"
@@ -37,21 +45,63 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install system deps (gpac/ffmpeg)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gpac ffmpeg
-
       - name: Install python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Show formats (-F) in log (optional but useful)
+      - name: Phase 1 - List formats (-F) and save to formats.txt
         run: |
-          python manzana.py --no-prompt --trailer "${{ inputs.trailer }}" -F "${{ inputs.url }}"
+          python manzana.py --no-prompt --trailer "${{ inputs.trailer }}" -F "${{ inputs.url }}" | tee formats.txt
 
-      - name: Download
+      - name: Upload formats as artifact (manzana-formats)
+        uses: actions/upload-artifact@v4
+        with:
+          name: manzana-formats
+          path: formats.txt
+          if-no-files-found: error
+
+      # -------- Phase 2 only (when format is provided) --------
+
+      - name: Cache FFmpeg (BtbN)
+        if: ${{ inputs.format != '' }}
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/ffmpeg-btbn
+          key: ffmpeg-btbn-master-latest-linux64-gpl-v1
+
+      - name: Install FFmpeg (BtbN Daily Build)
+        if: ${{ inputs.format != '' && steps.cache-ffmpeg.outputs.cache-hit != 'true' }}
+        run: |
+          mkdir -p ~/.local/ffmpeg-btbn
+          wget -O /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xf /tmp/ffmpeg.tar.xz -C ~/.local/ffmpeg-btbn --strip-components=1
+          ls -la ~/.local/ffmpeg-btbn/bin || true
+
+      - name: Add FFmpeg to PATH
+        if: ${{ inputs.format != '' }}
+        run: |
+          echo "$HOME/.local/ffmpeg-btbn/bin" >> $GITHUB_PATH
+
+      - name: Verify FFmpeg in PATH
+        if: ${{ inputs.format != '' }}
+        run: |
+          command -v ffmpeg
+          ffmpeg -version | head -n 3
+          command -v ffprobe
+          ffprobe -version | head -n 3
+
+      - name: Install MP4Box (gpac) [Phase 2 only]
+        if: ${{ inputs.format != '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gpac
+          command -v MP4Box
+          MP4Box -version || true
+
+      - name: Phase 2 - Download (skip if format is empty)
+        if: ${{ inputs.format != '' }}
         env:
           PYTHONUNBUFFERED: "1"
         run: |
@@ -61,7 +111,47 @@ jobs:
             python manzana.py --no-prompt --trailer "${{ inputs.trailer }}" -f "${{ inputs.format }}" "${{ inputs.url }}"
           fi
 
-      - name: Upload output as artifact
+      - name: Inspect output media info (ffprobe summary + JSON)
+        if: ${{ inputs.format != '' }}
+        run: |
+          mkdir -p report
+          shopt -s nullglob
+          files=(output/*.mp4)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No mp4 found in output/"
+            exit 1
+          fi
+
+          for f in "${files[@]}"; do
+            base="$(basename "$f")"
+            echo "=== Inspecting: $base ==="
+
+            echo "--- FORMAT (container) ---"
+            ffprobe -hide_banner -v error \
+              -show_entries format=filename,format_name,duration,size,bit_rate \
+              -of default=nw=1 "$f"
+
+            echo "--- STREAMS (tracks, includes bit_rate when available) ---"
+            ffprobe -hide_banner -v error \
+              -show_entries stream=index,codec_type,codec_name,profile,bit_rate,width,height,avg_frame_rate,channels,channel_layout,sample_rate:stream_tags=language,title \
+              -of default=nw=1 "$f"
+
+            echo "--- JSON (artifact) ---"
+            ffprobe -hide_banner -v error \
+              -show_format -show_streams \
+              -print_format json "$f" > "report/${base}.ffprobe.json"
+          done
+
+      - name: Upload inspection report as artifact (manzana-report)
+        if: ${{ inputs.format != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: manzana-report
+          path: report/
+          if-no-files-found: error
+
+      - name: Upload output as artifact (manzana-output)
+        if: ${{ inputs.format != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: manzana-output
