@@ -1,9 +1,11 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.4.8
-# - Improve 'format' description: clearer rules + multiple examples + explain empty behavior + recommend first run empty
-# - Add lightweight validation for 'format' in Validate inputs (must include exactly ONE vN if provided)
-# - Keep all other logic/steps unchanged from v1.4.5 (except description text)
+# .github/workflows/manzana-download.yml @ v1.5.0
+# Major update:
+# - Add mode switch: preset_av / preset_video / custom
+# - Add preset profiles and audio/sub menus (audio_quality includes 'none' for video-only file)
+# - Use tools/select_format.py to compute EFFECTIVE_FORMAT in preset modes
+# - Keep: fail-fast validation, Phase-1 list formats, default_only applied to -F, ffmpeg cache, ffprobe inspect, artifacts
 
 on:
   workflow_dispatch:
@@ -12,21 +14,113 @@ on:
         description: "Apple TV URL (movie/show page)"
         required: true
         type: string
+
+      # We keep trailer/default_only available for all modes (more flexible).
+      # Note: preset modes v0.1.0 do NOT support trailer=all (selector limitation).
       trailer:
-        description: 'Trailer selector: use t0, t1, t2... (e.g. "t0") or "all"'
+        description: 'Trailer selector: use t0, t1, t2... (e.g. "t0"). NOTE: preset modes do NOT support "all" (use custom mode if you need all).'
         required: false
         default: "t0"
         type: string
-      format:
-        description: 'OPTIONAL (recommended workflow): 1) Leave EMPTY on the first run to ONLY LIST ALL FORMATS (Phase 1) and upload formats.txt (NO DOWNLOAD). 2) After you choose IDs, rerun and set format. Must include EXACTLY ONE video id (vN). Examples: v6 | v6+a0 | v6+a0+s4 | v6+a0+a4+s4+s5. aN/sN are optional and can be multiple. Audio-only/subs-only (aN or sN without vN) is NOT supported.'
-        required: false
-        default: ""
-        type: string
+
       default_only:
-        description: "Use --default (only default trailer metadata)"
+        description: "Use --default (only default trailer metadata). Recommended if you only want the page's default/main video."
         required: false
         default: false
         type: boolean
+
+      # --- Mode switch ---
+      mode:
+        description: "Selection mode: preset menus (recommended) OR custom format string."
+        required: true
+        type: choice
+        default: preset_av
+        options:
+          - preset_av
+          - preset_video
+          - custom
+
+      # --- Preset AV (fixed combos) ---
+      preset_av_profile:
+        description: "Preset A/V profile (ONLY used when mode=preset_av)."
+        required: true
+        type: choice
+        default: 1080_SDR_AAC
+        options:
+          - 1080_SDR_AAC
+          - 4K_DOVI_ATMOS
+          - 4K_HDR_DD51
+
+      # --- Preset Video (video-first; audio optional) ---
+      preset_video_profile:
+        description: "Preset video profile (ONLY used when mode=preset_video). Fallback chain: 4K DoVi/HDR -> 1080 SDR -> 720 SDR -> error."
+        required: true
+        type: choice
+        default: 1080_SDR
+        options:
+          - 1080_SDR
+          - 4K_DOVI
+          - 4K_HDR
+
+      audio_quality:
+        description: "Audio quality (ONLY used when mode=preset_video). Fallback: if Atmos/DD5.1 not available -> AAC. Use 'none' for a true video-only output."
+        required: true
+        type: choice
+        default: AAC
+        options:
+          - none
+          - AAC
+          - Atmos
+          - DD5.1
+
+      audio_lang:
+        description: 'Audio language (preset modes only). "original" = original-content track. If selected language not available -> fallback to best original AAC (compatibility).'
+        required: true
+        type: choice
+        default: original
+        options:
+          - original
+          - en
+          - cmn-Hans
+          - cmn-Hant
+          - ja
+          - ko
+          - fr-FR
+          - fr-CA
+          - de
+          - es-ES
+          - es-419
+          - it
+          - pt-BR
+          - ru
+
+      sub_lang:
+        description: 'Subtitle language (preset modes only). Default "none". If subtitles missing or language not found -> no subtitles (no error).'
+        required: true
+        type: choice
+        default: none
+        options:
+          - none
+          - en
+          - cmn-Hans
+          - cmn-Hant
+          - ja
+          - ko
+          - fr-FR
+          - fr-CA
+          - de
+          - es-ES
+          - es-419
+          - it
+          - pt-BR
+          - ru
+
+      # --- Custom format string (yt-dlp style) ---
+      format:
+        description: 'CUSTOM mode only. Recommended workflow: (1) leave EMPTY on first run to ONLY LIST formats (Phase 1) and upload formats.txt (NO DOWNLOAD). (2) rerun and set format. Must include EXACTLY ONE vN. Examples: v6 | v6+a0 | v6+a0+s4 | v6+a0+a4+s4+s5. Audio-only/sub-only not supported.'
+        required: false
+        default: ""
+        type: string
 
 jobs:
   download:
@@ -34,14 +128,17 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Validate inputs
+      - name: Validate inputs (fail fast)
         run: |
           set -euo pipefail
 
-          # ---- trailer validation ----
+          MODE="${{ inputs.mode }}"
           TRAILER="${{ inputs.trailer }}"
+          FORMAT_IN="${{ inputs.format }}"
+
+          # ---- trailer validation ----
           if [[ -z "$TRAILER" ]]; then
-            echo "::error::Input 'trailer' is empty. Use t0, t1, t2... or all."
+            echo "::error::Input 'trailer' is empty. Use t0, t1, t2..."
             exit 1
           fi
 
@@ -51,62 +148,69 @@ jobs:
           else
             echo "::error::Invalid trailer input: '$TRAILER'"
             echo "Expected: t0, t1, t2... (t + digits) OR 'all' (or 'a')."
-            echo "Do NOT input: 't0 / t1 / all' or any text with spaces/slashes."
+            echo "Do NOT input spaces/slashes, e.g. 't0 / t1 / all'."
             exit 1
           fi
 
-          # ---- format validation (only if provided) ----
-          FORMAT="${{ inputs.format }}"
+          # preset modes do NOT support trailer=all in selector v0.1.0
+          if [[ "$MODE" != "custom" ]] && [[ "$TRAILER" =~ ^(all|a)$ ]]; then
+            echo "::error::In preset modes (preset_av/preset_video), trailer=all is not supported (selector v0.1.0)."
+            echo "Please use trailer=t0/t1/... OR switch mode=custom if you need trailer=all."
+            exit 1
+          fi
 
-          if [[ -z "$FORMAT" ]]; then
-            echo "OK: format is EMPTY -> this run will ONLY LIST formats (-F). No download will happen."
-            echo "Tip: After you choose IDs from the list, rerun and set format like: v6+a0+s4"
+          # ---- custom format validation (only when mode=custom and format provided) ----
+          if [[ "$MODE" == "custom" ]]; then
+            if [[ -z "$FORMAT_IN" ]]; then
+              echo "OK: mode=custom and format is EMPTY -> this run will ONLY LIST formats (Phase 1). No download will happen."
+              echo "Tip: After you pick IDs, rerun with format like: v6+a0+s4"
+            else
+              # Strip wrapping quotes if pasted
+              F="$FORMAT_IN"
+              if [[ ${#F} -ge 2 ]]; then
+                if [[ ( "${F:0:1}" == "\"" && "${F: -1}" == "\"" ) || ( "${F:0:1}" == "'" && "${F: -1}" == "'" ) ]]; then
+                  F="${F:1:-1}"
+                fi
+              fi
+
+              if [[ "$F" =~ [[:space:]] ]]; then
+                echo "::error::Invalid custom format: contains whitespace. Use '+' between ids, e.g. v6+a0+s4"
+                exit 1
+              fi
+
+              IFS='+' read -ra PARTS <<< "$F"
+              vcount=0
+              for p in "${PARTS[@]}"; do
+                if [[ -z "$p" ]]; then
+                  echo "::error::Invalid custom format: empty token (check for '++')."
+                  exit 1
+                fi
+                if [[ "$p" =~ ^[vV][0-9]+$ ]]; then
+                  ((vcount+=1))
+                elif [[ "$p" =~ ^[aA][0-9]+$ ]]; then
+                  true
+                elif [[ "$p" =~ ^[sS][0-9]+$ ]]; then
+                  true
+                else
+                  echo "::error::Invalid token '$p' in custom format."
+                  echo "Allowed tokens: vN (video), aN (audio), sN (subtitle)."
+                  exit 1
+                fi
+              done
+
+              if [[ "$vcount" -ne 1 ]]; then
+                echo "::error::Invalid custom format: must include EXACTLY ONE video id (vN)."
+                echo "Valid examples: v6 | v6+a0 | v6+a0+s4"
+                exit 1
+              fi
+
+              echo "OK: custom format looks valid."
+            fi
           else
-            # Strip wrapping quotes if user pasted them
-            if [[ ${#FORMAT} -ge 2 ]]; then
-              if [[ ( "${FORMAT:0:1}" == "\"" && "${FORMAT: -1}" == "\"" ) || ( "${FORMAT:0:1}" == "'" && "${FORMAT: -1}" == "'" ) ]]; then
-                FORMAT="${FORMAT:1:-1}"
-              fi
+            # preset modes: ignore 'format' field, but warn if user filled it
+            if [[ -n "$FORMAT_IN" ]]; then
+              echo "::warning::mode=$MODE: input 'format' will be ignored (preset mode uses selector)."
             fi
-
-            # Reject whitespace to avoid ambiguous parsing
-            if [[ "$FORMAT" =~ [[:space:]] ]]; then
-              echo "::error::Invalid format: contains whitespace. Use '+' between ids, e.g. v6+a0+s4"
-              exit 1
-            fi
-
-            IFS='+' read -ra PARTS <<< "$FORMAT"
-            vcount=0
-
-            for p in "${PARTS[@]}"; do
-              if [[ -z "$p" ]]; then
-                echo "::error::Invalid format: empty token (check for '++')."
-                echo "Valid examples: v6 | v6+a0 | v6+a0+s4 | v6+a0+a4+s4+s5"
-                exit 1
-              fi
-
-              if [[ "$p" =~ ^[vV][0-9]+$ ]]; then
-                ((vcount+=1))
-              elif [[ "$p" =~ ^[aA][0-9]+$ ]]; then
-                true
-              elif [[ "$p" =~ ^[sS][0-9]+$ ]]; then
-                true
-              else
-                echo "::error::Invalid token '$p' in format."
-                echo "Allowed tokens: vN (video), aN (audio), sN (subtitle)."
-                echo "Valid examples: v6 | v6+a0 | v6+a0+s4 | v6+a0+a4+s4+s5"
-                exit 1
-              fi
-            done
-
-            if [[ "$vcount" -ne 1 ]]; then
-              echo "::error::Invalid format: must include EXACTLY ONE video id (vN)."
-              echo "Valid examples: v6 (video-only) OR v6+a0+s4 (video+audio+subs)."
-              echo "Not supported: a0 (audio-only), s4 (subs-only), v1+v2+a0 (multiple video ids)."
-              exit 1
-            fi
-
-            echo "OK: format=$FORMAT"
           fi
 
       - name: Checkout
@@ -138,10 +242,76 @@ jobs:
           path: formats.txt
           if-no-files-found: error
 
-      # -------- Phase 2 only (when format is provided) --------
+      - name: Compute EFFECTIVE_FORMAT (preset/custom)
+        run: |
+          set -euo pipefail
+
+          MODE="${{ inputs.mode }}"
+          URL="${{ inputs.url }}"
+          TRAILER="${{ inputs.trailer }}"
+          DEFAULT_ONLY="${{ inputs.default_only }}"
+
+          # default flag for selector
+          DEFAULT_FLAG=""
+          if [[ "$DEFAULT_ONLY" == "true" ]]; then
+            DEFAULT_FLAG="--default-only"
+          fi
+
+          if [[ "$MODE" == "custom" ]]; then
+            # Use user-provided format as-is (may be empty)
+            F="${{ inputs.format }}"
+            # Strip wrapping quotes if pasted
+            if [[ ${#F} -ge 2 ]]; then
+              if [[ ( "${F:0:1}" == "\"" && "${F: -1}" == "\"" ) || ( "${F:0:1}" == "'" && "${F: -1}" == "'" ) ]]; then
+                F="${F:1:-1}"
+              fi
+            fi
+
+            echo "EFFECTIVE_FORMAT=$F" >> "$GITHUB_ENV"
+            if [[ -z "$F" ]]; then
+              echo "DO_DOWNLOAD=false" >> "$GITHUB_ENV"
+              echo "mode=custom: format empty -> list only, no download."
+            else
+              echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
+              echo "mode=custom: will download with format: $F"
+            fi
+          elif [[ "$MODE" == "preset_av" ]]; then
+            # Compute format using selector
+            EFF="$(python tools/select_format.py \
+              --url "$URL" \
+              --trailer "$TRAILER" \
+              $DEFAULT_FLAG \
+              --mode preset_av \
+              --preset-av-profile "${{ inputs.preset_av_profile }}" \
+              --audio-lang "${{ inputs.audio_lang }}" \
+              --sub-lang "${{ inputs.sub_lang }}" \
+            )"
+            echo "EFFECTIVE_FORMAT=$EFF" >> "$GITHUB_ENV"
+            echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
+            echo "mode=preset_av: computed format: $EFF"
+          elif [[ "$MODE" == "preset_video" ]]; then
+            EFF="$(python tools/select_format.py \
+              --url "$URL" \
+              --trailer "$TRAILER" \
+              $DEFAULT_FLAG \
+              --mode preset_video \
+              --preset-video-profile "${{ inputs.preset_video_profile }}" \
+              --audio-quality "${{ inputs.audio_quality }}" \
+              --audio-lang "${{ inputs.audio_lang }}" \
+              --sub-lang "${{ inputs.sub_lang }}" \
+            )"
+            echo "EFFECTIVE_FORMAT=$EFF" >> "$GITHUB_ENV"
+            echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
+            echo "mode=preset_video: computed format: $EFF"
+          else
+            echo "::error::Unknown mode '$MODE'"
+            exit 1
+          fi
+
+      # -------- Phase 2 only (when DO_DOWNLOAD=true) --------
 
       - name: Cache FFmpeg (BtbN)
-        if: ${{ inputs.format != '' }}
+        if: ${{ env.DO_DOWNLOAD == 'true' }}
         id: cache-ffmpeg
         uses: actions/cache@v4
         with:
@@ -149,7 +319,7 @@ jobs:
           key: ffmpeg-btbn-master-latest-linux64-gpl-v1
 
       - name: Install FFmpeg (BtbN Daily Build)
-        if: ${{ inputs.format != '' && steps.cache-ffmpeg.outputs.cache-hit != 'true' }}
+        if: ${{ env.DO_DOWNLOAD == 'true' && steps.cache-ffmpeg.outputs.cache-hit != 'true' }}
         run: |
           mkdir -p ~/.local/ffmpeg-btbn
           wget -O /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz
@@ -157,12 +327,12 @@ jobs:
           ls -la ~/.local/ffmpeg-btbn/bin || true
 
       - name: Add FFmpeg to PATH
-        if: ${{ inputs.format != '' }}
+        if: ${{ env.DO_DOWNLOAD == 'true' }}
         run: |
           echo "$HOME/.local/ffmpeg-btbn/bin" >> $GITHUB_PATH
 
       - name: Verify FFmpeg in PATH
-        if: ${{ inputs.format != '' }}
+        if: ${{ env.DO_DOWNLOAD == 'true' }}
         run: |
           command -v ffmpeg
           ffmpeg -version | head -n 3
@@ -170,26 +340,27 @@ jobs:
           ffprobe -version | head -n 3
 
       - name: Install MP4Box (gpac) [Phase 2 only]
-        if: ${{ inputs.format != '' }}
+        if: ${{ env.DO_DOWNLOAD == 'true' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y gpac
           command -v MP4Box
           MP4Box -version || true
 
-      - name: Phase 2 - Download (skip if format is empty)
-        if: ${{ inputs.format != '' }}
+      - name: Phase 2 - Download (uses EFFECTIVE_FORMAT)
+        if: ${{ env.DO_DOWNLOAD == 'true' }}
         env:
           PYTHONUNBUFFERED: "1"
         run: |
+          echo "Using EFFECTIVE_FORMAT=${EFFECTIVE_FORMAT}"
           if [ "${{ inputs.default_only }}" = "true" ]; then
-            python manzana.py --default --no-prompt --trailer "${{ inputs.trailer }}" -f "${{ inputs.format }}" "${{ inputs.url }}"
+            python manzana.py --default --no-prompt --trailer "${{ inputs.trailer }}" -f "${EFFECTIVE_FORMAT}" "${{ inputs.url }}"
           else
-            python manzana.py --no-prompt --trailer "${{ inputs.trailer }}" -f "${{ inputs.format }}" "${{ inputs.url }}"
+            python manzana.py --no-prompt --trailer "${{ inputs.trailer }}" -f "${EFFECTIVE_FORMAT}" "${{ inputs.url }}"
           fi
 
       - name: Inspect output media info (ffprobe summary + JSON)
-        if: ${{ inputs.format != '' }}
+        if: ${{ env.DO_DOWNLOAD == 'true' }}
         run: |
           mkdir -p report
           shopt -s nullglob
@@ -220,7 +391,7 @@ jobs:
           done
 
       - name: Upload inspection report as artifact (manzana-report)
-        if: ${{ inputs.format != '' }}
+        if: ${{ env.DO_DOWNLOAD == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: manzana-report
@@ -228,7 +399,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload output as artifact (manzana-output)
-        if: ${{ inputs.format != '' }}
+        if: ${{ env.DO_DOWNLOAD == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: manzana-output
