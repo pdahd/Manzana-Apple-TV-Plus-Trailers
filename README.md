@@ -19,10 +19,10 @@ A python program to download Apple TV Plus movie and tv-show trailers. Video str
 
 ## __How to use?__
 
-First of all clone this project or download the project as a zip file and extract it to your pc. (or you can see [Releases](https://github.com/dropcreations/Manzana-Apple-TV-Plus-Trailers/releases))
+First of all clone this project or download the project as a zip file and extract it to your pc.
 
 ```
-git clone https://github.com/dropcreations/Manzana-Apple-TV-Plus-Trailers.git
+git clone https://github.com/pdahd/Manzana-Apple-TV-Plus-Trailers.git
 cd Manzana-Apple-TV-Plus-Trailers
 ```
 
@@ -67,26 +67,77 @@ python manzana.py --no-subs [url]
 This will ask for you what trailer to download when the url has multiple trailers. If you want all, simply type `all` or `a` to select all or type the ID. If you want to downlaod the default trailer in the url without seeing available trailers, use `--default` or `-d` argument with command
 
 ```
-python manzana.py --d [url]
+python manzana.py -d [url]
 ```
 
 Get help using `-h` or `--help` command
 
 ```
-usage: manzana.py [-h] [-v] [-d] [-an] [-sn] url
+usage: manzana.py [-h] [-v] [--list-trailers] [--trailer TRAILER] [-F]
+                  [-f FORMAT] [--no-prompt] [-d] [-an] [-sn]
+                  url
 
 Manzana: Apple TV Plus Trailers Downloader
 
 positional arguments:
-  url              AppleTV+ URL for a movie or a tv-show.
+  url                   AppleTV+ URL for a movie or a tv-show.
 
 optional arguments:
-  -h, --help       show this help message and exit
-  -v, --version    show program's version number and exit
-  -d, --default    get only the default content trailer. (default: False)
-  -an, --no-audio  don't download audio streams. (default: False)
-  -sn, --no-subs   don't download subtitle streams. (default: False)
+  -h, --help            show this help message and exit
+  -v, --version         show program's version number and exit
+  --list-trailers       list available trailers (t0, t1, ...) and exit
+  --trailer TRAILER     select trailer by id (e.g. t0, t1) or "all"
+  -F, --list-formats    list available video/audio/subtitle streams and exit
+  -f FORMAT, --format FORMAT
+                        format selector, e.g. "v0+a0+s4" (use -F to see ids)
+  --no-prompt           disable any interactive prompts (CI/Actions friendly)
+  -d, --default         get only the default content trailer. (default: False)
+  -an, --no-audio       don't download audio streams. (default: False)
+  -sn, --no-subs        don't download subtitle streams. (default: False)
 ```
+
+## __Non-interactive / CI usage (yt-dlp style)__
+
+This fork adds a non-interactive workflow for automation environments (GitHub Actions / scripts / CI),
+while keeping the original interactive "select IDs" mode when running in a real terminal.
+
+### List trailers on a page
+
+Some Apple TV pages contain multiple videos (teaser, trailer, clip, featurette, etc.). List them first:
+
+```bash
+python manzana.py --list-trailers "<Apple TV URL>"
+```
+
+### List formats (streams) for a trailer
+
+List video/audio/subtitle tracks and print the Master M3U8 URL:
+
+```bash
+python manzana.py --no-prompt --trailer t0 -F "<Apple TV URL>"
+```
+
+### Download by format id (no prompts)
+
+Use the IDs from `-F` output:
+
+```bash
+python manzana.py --no-prompt --trailer t0 -f "v6+a0+s4" "<Apple TV URL>"
+```
+
+Notes:
+- `vN` selects exactly **one** video stream.
+- `aN` and `sN` can be multiple (e.g. `v6+a0+a4+s4+s5`).
+- In non-interactive mode, if `-f/--format` is not provided, Manzana will exit with an error instead of prompting.
+- `--trailer all` will try to apply the same `-f` selector to every trailer on the page. This may fail if some trailers don't have the same tracks.
+
+### GitHub Actions
+
+This repository includes a workflow that can list formats and optionally download the selected streams.
+Go to **Actions** → run the workflow and provide:
+- `url`
+- `trailer` (e.g. `t0`)
+- `format` (e.g. `v6+a0+s4`, optional)
 
 ## Support
 
