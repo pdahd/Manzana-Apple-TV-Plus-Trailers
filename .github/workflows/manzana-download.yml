@@ -1,8 +1,9 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.4.5
-# - Move Validate inputs step before Checkout to fail fast
-# - Keep everything else unchanged
+# .github/workflows/manzana-download.yml @ v1.4.8
+# - Improve 'format' description: clearer rules + multiple examples + explain empty behavior + recommend first run empty
+# - Add lightweight validation for 'format' in Validate inputs (must include exactly ONE vN if provided)
+# - Keep all other logic/steps unchanged from v1.4.5 (except description text)
 
 on:
   workflow_dispatch:
@@ -17,7 +18,7 @@ on:
         default: "t0"
         type: string
       format:
-        description: 'Optional. Format IDs like v0+a0+s4 (NOT "-F"). Leave empty to only list formats.'
+        description: 'OPTIONAL (recommended workflow): 1) Leave EMPTY on the first run to ONLY LIST ALL FORMATS (Phase 1) and upload formats.txt (NO DOWNLOAD). 2) After you choose IDs, rerun and set format. Must include EXACTLY ONE video id (vN). Examples: v6 | v6+a0 | v6+a0+s4 | v6+a0+a4+s4+s5. aN/sN are optional and can be multiple. Audio-only/subs-only (aN or sN without vN) is NOT supported.'
         required: false
         default: ""
         type: string
@@ -36,6 +37,8 @@ jobs:
       - name: Validate inputs
         run: |
           set -euo pipefail
+
+          # ---- trailer validation ----
           TRAILER="${{ inputs.trailer }}"
           if [[ -z "$TRAILER" ]]; then
             echo "::error::Input 'trailer' is empty. Use t0, t1, t2... or all."
@@ -50,6 +53,60 @@ jobs:
             echo "Expected: t0, t1, t2... (t + digits) OR 'all' (or 'a')."
             echo "Do NOT input: 't0 / t1 / all' or any text with spaces/slashes."
             exit 1
+          fi
+
+          # ---- format validation (only if provided) ----
+          FORMAT="${{ inputs.format }}"
+
+          if [[ -z "$FORMAT" ]]; then
+            echo "OK: format is EMPTY -> this run will ONLY LIST formats (-F). No download will happen."
+            echo "Tip: After you choose IDs from the list, rerun and set format like: v6+a0+s4"
+          else
+            # Strip wrapping quotes if user pasted them
+            if [[ ${#FORMAT} -ge 2 ]]; then
+              if [[ ( "${FORMAT:0:1}" == "\"" && "${FORMAT: -1}" == "\"" ) || ( "${FORMAT:0:1}" == "'" && "${FORMAT: -1}" == "'" ) ]]; then
+                FORMAT="${FORMAT:1:-1}"
+              fi
+            fi
+
+            # Reject whitespace to avoid ambiguous parsing
+            if [[ "$FORMAT" =~ [[:space:]] ]]; then
+              echo "::error::Invalid format: contains whitespace. Use '+' between ids, e.g. v6+a0+s4"
+              exit 1
+            fi
+
+            IFS='+' read -ra PARTS <<< "$FORMAT"
+            vcount=0
+
+            for p in "${PARTS[@]}"; do
+              if [[ -z "$p" ]]; then
+                echo "::error::Invalid format: empty token (check for '++')."
+                echo "Valid examples: v6 | v6+a0 | v6+a0+s4 | v6+a0+a4+s4+s5"
+                exit 1
+              fi
+
+              if [[ "$p" =~ ^[vV][0-9]+$ ]]; then
+                ((vcount+=1))
+              elif [[ "$p" =~ ^[aA][0-9]+$ ]]; then
+                true
+              elif [[ "$p" =~ ^[sS][0-9]+$ ]]; then
+                true
+              else
+                echo "::error::Invalid token '$p' in format."
+                echo "Allowed tokens: vN (video), aN (audio), sN (subtitle)."
+                echo "Valid examples: v6 | v6+a0 | v6+a0+s4 | v6+a0+a4+s4+s5"
+                exit 1
+              fi
+            done
+
+            if [[ "$vcount" -ne 1 ]]; then
+              echo "::error::Invalid format: must include EXACTLY ONE video id (vN)."
+              echo "Valid examples: v6 (video-only) OR v6+a0+s4 (video+audio+subs)."
+              echo "Not supported: a0 (audio-only), s4 (subs-only), v1+v2+a0 (multiple video ids)."
+              exit 1
+            fi
+
+            echo "OK: format=$FORMAT"
           fi
 
       - name: Checkout
