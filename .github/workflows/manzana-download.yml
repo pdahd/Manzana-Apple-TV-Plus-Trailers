@@ -1,11 +1,9 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.4.3
-# - Phase-1: list formats (-F) and upload formats.txt
-# - Phase-2: download only when "format" input is non-empty
-# - Cache FFmpeg/ffprobe via BtbN prebuilt binaries (actions/cache)
-# - Install only gpac (MP4Box) via apt in Phase-2 (no apt ffmpeg)
-# - Inspect: print ffprobe summary (with per-stream bit_rate) + upload JSON
+# .github/workflows/manzana-download.yml @ v1.4.4
+# - Improve trailer input description (avoid user confusion)
+# - Add trailer input validation step (t<number> or all/a)
+# - Keep everything else unchanged
 
 on:
   workflow_dispatch:
@@ -15,7 +13,7 @@ on:
         required: true
         type: string
       trailer:
-        description: "Trailer id: t0 / t1 / all"
+        description: 'Trailer selector: use t0, t1, t2... (e.g. "t0") or "all"'
         required: false
         default: "t0"
         type: string
@@ -49,6 +47,25 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          TRAILER="${{ inputs.trailer }}"
+          if [[ -z "$TRAILER" ]]; then
+            echo "::error::Input 'trailer' is empty. Use t0, t1, t2... or all."
+            exit 1
+          fi
+
+          # allow: all / a / t<number>
+          if [[ "$TRAILER" =~ ^(all|a|t[0-9]+)$ ]]; then
+            echo "OK: trailer=$TRAILER"
+          else
+            echo "::error::Invalid trailer input: '$TRAILER'"
+            echo "Expected: t0, t1, t2... (t + digits) OR 'all' (or 'a')."
+            echo "Do NOT input: 't0 / t1 / all' or any text with spaces/slashes."
+            exit 1
+          fi
 
       - name: Phase 1 - List formats (-F) and save to formats.txt
         run: |
