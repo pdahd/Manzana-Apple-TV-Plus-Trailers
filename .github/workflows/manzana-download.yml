@@ -52,7 +52,11 @@ jobs:
 
       - name: Phase 1 - List formats (-F) and save to formats.txt
         run: |
-          python manzana.py --no-prompt --trailer "${{ inputs.trailer }}" -F "${{ inputs.url }}" | tee formats.txt
+          if [ "${{ inputs.default_only }}" = "true" ]; then
+            python manzana.py --default --no-prompt --trailer "${{ inputs.trailer }}" -F "${{ inputs.url }}" | tee formats.txt
+          else
+            python manzana.py --no-prompt --trailer "${{ inputs.trailer }}" -F "${{ inputs.url }}" | tee formats.txt
+          fi
 
       - name: Upload formats as artifact (manzana-formats)
         uses: actions/upload-artifact@v4
