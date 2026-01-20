@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
-# tools/select_format.py @ v0.1.0
+# tools/select_format.py @ v0.1.1
 #
-# Purpose:
-#   Select an "effective" Manzana -f format string (e.g. v6+a0+s4) in preset modes.
-#   Designed for GitHub Actions workflow presets. Avoid parsing rich table output;
-#   instead reuse Manzana's own HLS parsing to get structured tracks.
+# Fix in v0.1.1:
+#   Ensure stdout is clean (ONLY the final effective format string).
+#   Manzana's internal logger prints INFO lines via Rich Console to stdout by default.
+#   We redirect Manzana's Rich Console to stderr so workflow can safely capture stdout.
 #
 # Output:
-#   Print ONLY the effective format string to stdout (so workflow can capture it).
-#   Debug/explanation is written to stderr.
-#
-# Notes:
-#   - Must select EXACTLY ONE video id (vN).
-#   - Audio and subtitles are optional.
-#   - Audio-only or subtitle-only (without vN) is NOT supported by current Manzana CLI.
+#   - stdout: ONLY the effective format string (e.g. v6+a0+s4) or "" (custom empty)
+#   - stderr: selection explanation + Manzana INFO logs
 
 from __future__ import annotations
 
@@ -29,6 +24,30 @@ from typing import Any, Dict, List, Optional, Tuple
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+
+def _redirect_manzana_logs_to_stderr() -> None:
+    """
+    Manzana uses utils/logger.py which prints via a module-level Rich Console `cons`
+    defaulting to stdout. That pollutes stdout when this selector is captured by bash.
+
+    We redirect that console to stderr, so:
+      - selector stdout remains only the final format string
+      - logs still appear in Actions logs (stderr)
+    """
+    try:
+        from rich.console import Console
+        import utils.logger as manzana_logger
+
+        # Replace Console to print to stderr
+        manzana_logger.cons = Console(file=sys.stderr)
+    except Exception:
+        # If rich or module not available, do nothing.
+        pass
+
+
+# Redirect as early as possible (safe even if used in custom mode)
+_redirect_manzana_logs_to_stderr()
 
 
 try:
@@ -53,11 +72,11 @@ def die(msg: str, code: int = 2) -> None:
 def _parse_trailer_arg(trailer: str) -> int:
     """
     Accept: t0, t1, ... or 0,1,2...
-    Reject: all/a (preset mode v0.1.0 does not support trailer=all)
+    Reject: all/a (preset mode v0.1.x does not support trailer=all)
     """
     t = (trailer or "").strip().lower()
     if t in ("all", "a"):
-        die("trailer=all is not supported in preset modes (v0.1.0). Use t0/t1/...")
+        die("trailer=all is not supported in preset modes (v0.1.x). Use t0/t1/...")
     if t.startswith("t"):
         t = t[1:]
     if not t.isdigit():
@@ -79,7 +98,6 @@ def _parse_bitrate_to_bps(bitrate: Any) -> int:
     if bitrate is None:
         return 0
     if isinstance(bitrate, (int, float)):
-        # already numeric (unknown unit) - treat as bps if large, else kbps-ish; best effort
         v = float(bitrate)
         if v > 1_000_000:
             return int(v)
@@ -88,10 +106,6 @@ def _parse_bitrate_to_bps(bitrate: Any) -> int:
         return int(v)
 
     s = str(bitrate).strip()
-    # Examples:
-    #  - "24.83 Mb/s"
-    #  - "488 Kb/s"
-    #  - "Null"
     if not s or s.lower() == "null":
         return 0
 
@@ -148,7 +162,12 @@ def _sub_sort_key(t: Dict[str, Any]) -> Tuple[str, int, int]:
     )
 
 
-def _with_ids(items: List[Dict[str, Any]], prefix: str, sort_key=None, reverse: bool = False) -> List[Dict[str, Any]]:
+def _with_ids(
+    items: List[Dict[str, Any]],
+    prefix: str,
+    sort_key=None,
+    reverse: bool = False
+) -> List[Dict[str, Any]]:
     items2 = list(items)
     if sort_key:
         items2.sort(key=sort_key, reverse=reverse)
@@ -181,11 +200,18 @@ def _is_width_at_least(track: Dict[str, Any], wmin: int) -> bool:
         return False
 
 
-def _select_best_video(tracks: List[Dict[str, Any]], *, want_range: str, min_width: int) -> Optional[Dict[str, Any]]:
-    cand = [t for t in tracks if str(t.get("range")) == want_range and _is_width_at_least(t, min_width)]
+def _select_best_video(
+    tracks: List[Dict[str, Any]],
+    *,
+    want_range: str,
+    min_width: int
+) -> Optional[Dict[str, Any]]:
+    cand = [
+        t for t in tracks
+        if str(t.get("range")) == want_range and _is_width_at_least(t, min_width)
+    ]
     if not cand:
         return None
-    # already sorted by (area,bw) desc if coming from index_tracks, but be explicit:
     cand.sort(key=_video_sort_key, reverse=True)
     return cand[0]
 
@@ -194,23 +220,20 @@ def _select_video_with_fallback(video_tracks: List[Dict[str, Any]], primary: Tup
     """
     Fallback chain (as per requirements):
       - try primary (range,width)
-      - if primary is 4K DoVi/HDR -> fallback to 1080 SDR
-      - if 1080 SDR missing -> fallback to 720 SDR
-      - if 720 SDR missing -> hard error
+      - fallback to 1080 SDR
+      - fallback to ~720 SDR
+      - hard error if nothing
     """
     primary_range, primary_wmin = primary
 
-    # Primary attempt
     v = _select_best_video(video_tracks, want_range=primary_range, min_width=primary_wmin)
     if v:
         return v
 
-    # If primary isn't already 1080 SDR, fallback to 1080 SDR
     v1080 = _select_best_video(video_tracks, want_range="SDR", min_width=1800)
     if v1080:
         return v1080
 
-    # Fallback to ~720 SDR
     v720 = _select_best_video(video_tracks, want_range="SDR", min_width=1200)
     if v720:
         return v720
@@ -219,15 +242,16 @@ def _select_video_with_fallback(video_tracks: List[Dict[str, Any]], primary: Tup
 
 
 def _audio_bps(t: Dict[str, Any]) -> int:
-    # audio 'bitrate' is like '488 Kb/s' or '160 Kb/s'
-    b = _parse_bitrate_to_bps(t.get("bitrate"))
-    if b:
-        return b
-    # no explicit bitrate: treat as 0
-    return 0
+    return _parse_bitrate_to_bps(t.get("bitrate"))
 
 
-def _best_audio_in_codec(audio_tracks: List[Dict[str, Any]], *, codec: str, lang: Optional[str], require_original: bool) -> Optional[Dict[str, Any]]:
+def _best_audio_in_codec(
+    audio_tracks: List[Dict[str, Any]],
+    *,
+    codec: str,
+    lang: Optional[str],
+    require_original: bool
+) -> Optional[Dict[str, Any]]:
     cand = []
     for t in audio_tracks:
         if t.get("isAD"):
@@ -242,7 +266,6 @@ def _best_audio_in_codec(audio_tracks: List[Dict[str, Any]], *, codec: str, lang
 
     if not cand:
         return None
-    # pick highest bitrate
     cand.sort(key=_audio_bps, reverse=True)
     return cand[0]
 
@@ -252,20 +275,16 @@ def _best_audio_aac_original(audio_tracks: List[Dict[str, Any]]) -> Optional[Dic
     Compatibility-first fallback:
       prefer AAC over HE-AAC, original language, highest bitrate.
     """
-    # Try AAC original
     a = _best_audio_in_codec(audio_tracks, codec="AAC", lang=None, require_original=True)
     if a:
         return a
-    # Try HE-AAC original
     a = _best_audio_in_codec(audio_tracks, codec="HE-AAC", lang=None, require_original=True)
     if a:
         return a
-    # If no original flags exist, fallback to any AAC
     a = _best_audio_in_codec(audio_tracks, codec="AAC", lang=None, require_original=False)
     if a:
         return a
-    a = _best_audio_in_codec(audio_tracks, codec="HE-AAC", lang=None, require_original=False)
-    return a
+    return _best_audio_in_codec(audio_tracks, codec="HE-AAC", lang=None, require_original=False)
 
 
 def _select_audio(
@@ -293,7 +312,6 @@ def _select_audio(
     if aq.lower() == "none":
         return None
 
-    # normalize
     if aq.lower() == "aac":
         want_codec = "AAC"
     elif aq.lower() == "atmos":
@@ -312,7 +330,7 @@ def _select_audio(
         want_lang = al
         require_original = False
 
-    # 1) Try requested codec + requested language/original
+    # 1) try requested codec
     if require_original:
         a = _best_audio_in_codec(audio_tracks, codec=want_codec, lang=None, require_original=True)
     else:
@@ -321,9 +339,7 @@ def _select_audio(
     if a:
         return a
 
-    # 2) Fallback rules:
-    # - If requested codec doesn't exist, fallback to AAC (compat) without failing
-    # - If requested language doesn't exist, fallback to original AAC best
+    # 2) fallback to best original AAC (compat)
     return _best_audio_aac_original(audio_tracks)
 
 
@@ -332,12 +348,11 @@ def _select_subtitle(sub_tracks: List[Dict[str, Any]], sub_lang: str) -> Optiona
     if sl.lower() in ("", "none", "off", "no"):
         return None
 
-    # find matching language
     cand = [t for t in sub_tracks if str(t.get("language")) == sl]
     if not cand:
         return None
 
-    # prefer Normal (not SDH, not forced)
+    # prefer Normal: not SDH, not forced
     def pref_key(t: Dict[str, Any]) -> Tuple[int, int]:
         return (1 if t.get("isSDH") else 0, 1 if t.get("isForced") else 0)
 
@@ -360,11 +375,7 @@ class PresetVideoProfile:
     primary_video_min_width: int
 
 
-# --- CUT HERE: paste part2 below this line ---
-# --- Part 2 continues ---
-
 PRESET_AV_PROFILES: Dict[str, PresetAVProfile] = {
-    # Keys are workflow-friendly identifiers
     "1080_SDR_AAC": PresetAVProfile(
         name="1080p SDR + AAC (best bitrate, original)",
         want_video_range="SDR",
@@ -425,23 +436,19 @@ def _fetch_trailer_item(url: str, *, trailer_idx: int, default_only: bool) -> Di
 
 def _select_effective_format_custom(expr: str) -> str:
     """
-    For mode=custom. We do only a lightweight sanity check here,
-    because Manzana itself will validate too.
-    Must include exactly one vN.
+    For mode=custom. Lightweight sanity check.
+    Must include exactly one vN. Empty means "list-only" in workflow.
     """
     if not expr or not expr.strip():
-        # Empty means "list only" in workflow
         return ""
 
     tokens = [t.strip() for t in expr.split("+") if t.strip()]
     v = [t for t in tokens if re.match(r"^[vV][0-9]+$", t)]
     if len(v) != 1:
         die("Custom format must include exactly one video token vN (e.g. v6+a0+s4).")
-    # reject unknown tokens early
     for t in tokens:
         if not re.match(r"^[vVaAsS][0-9]+$", t):
             die(f"Invalid token in custom format: '{t}' (expected vN/aN/sN).")
-    # normalize to lowercase
     tokens = [t.lower() for t in tokens]
     return "+".join(tokens)
 
@@ -461,16 +468,9 @@ def _select_preset_av(
     auds = indexed["audio"]
     subs = indexed["subtitle"]
 
-    # video (with fallback chain)
-    if prof.want_video_range in ("DoVi", "HDR"):
-        v = _select_video_with_fallback(vids, (prof.want_video_range, prof.want_video_min_width))
-    else:
-        # SDR primary (also has fallback inside)
-        v = _select_video_with_fallback(vids, ("SDR", prof.want_video_min_width))
+    v = _select_video_with_fallback(vids, (prof.want_video_range, prof.want_video_min_width))
 
-    # audio fixed codec by profile
     a = _select_audio(auds, audio_quality="ignored", audio_lang=audio_lang, fixed_codec=prof.fixed_audio_codec)
-    # If audio missing entirely, we still can output video-only (but we try hard not to fail)
     if a is None:
         eprint("[selector] WARN: audio not selected (no suitable audio found); output will be video-only.")
 
@@ -508,15 +508,12 @@ def _select_preset_video(
 
     v = _select_video_with_fallback(vids, (prof.primary_video_range, prof.primary_video_min_width))
 
-    # audio_quality can be 'none' / 'AAC' / 'Atmos' / 'DD5.1'
     a = _select_audio(auds, audio_quality=audio_quality, audio_lang=audio_lang, fixed_codec=None)
-
-    # If user asked for audio but it doesn't exist, _select_audio() falls back to AAC original best.
-    # If audio_quality=none -> a is None.
     s = _select_subtitle(subs, sub_lang)
 
     eprint(f"[selector] preset_video_profile={profile_key} -> {prof.name}")
     eprint(f"[selector] selected video: {v['fid']} range={v.get('range')} res={v.get('resolution')} br={v.get('bitrate')}")
+
     if (audio_quality or "").strip().lower() == "none":
         eprint("[selector] audio_quality=none -> selected audio: (none)")
     else:
@@ -524,6 +521,7 @@ def _select_preset_video(
             eprint(f"[selector] selected audio: {a['fid']} codec={a.get('codec')} lang={a.get('language')} br={a.get('bitrate')} OG={a.get('isOriginal')}")
         else:
             eprint("[selector] WARN: audio not selected (no suitable audio found); output will be video-only.")
+
     if s:
         eprint(f"[selector] selected subtitle: {s['fid']} lang={s.get('language')} forced={s.get('isForced')} sdh={s.get('isSDH')}")
     else:
@@ -538,7 +536,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     p.add_argument("--url", required=True, help="Apple TV page URL")
-    p.add_argument("--trailer", default="t0", help='Trailer selector (t0, t1, ...). "all" is not supported in presets v0.1.0')
+    p.add_argument("--trailer", default="t0", help='Trailer selector (t0, t1, ...). "all" is not supported in presets v0.1.x')
     p.add_argument("--default-only", action="store_true", help="Use Manzana --default logic (default background video)")
     p.add_argument("--mode", required=True, choices=["preset_av", "preset_video", "custom"], help="Selection mode")
 
@@ -561,11 +559,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # custom mode: we don't need to fetch tracks if format is empty (meaning list-only)
     if args.mode == "custom":
         eff = _select_effective_format_custom(args.custom_format)
-        # print only effective format
         print(eff)
         return 0
 
-    # preset modes require fetching tracks
     item = _fetch_trailer_item(args.url, trailer_idx=trailer_idx, default_only=bool(args.default_only))
     master_url = item.get("hlsUrl")
     if not master_url:
@@ -576,7 +572,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not indexed["video"]:
         die("No video tracks found.")
-    # audio/subtitle can be empty; handled by selection logic with fallbacks
 
     if args.mode == "preset_av":
         eff = _select_preset_av(
