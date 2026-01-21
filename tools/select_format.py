@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-# tools/select_format.py @ v0.1.1
+# tools/select_format.py @ v0.1.2
 #
-# Fix in v0.1.1:
-#   Ensure stdout is clean (ONLY the final effective format string).
-#   Manzana's internal logger prints INFO lines via Rich Console to stdout by default.
-#   We redirect Manzana's Rich Console to stderr so workflow can safely capture stdout.
+# Fix in v0.1.2:
+#   Make "1080" presets STRICT:
+#     - Do NOT allow 4K SDR to satisfy 1080 preset.
+#     - 1080 band: 1800 <= width < 3500
+#     - 720 band fallback: 1200 <= width < 1800
+#     - 4K band: width >= 3500 (no upper bound)
 #
-# Output:
-#   - stdout: ONLY the effective format string (e.g. v6+a0+s4) or "" (custom empty)
-#   - stderr: selection explanation + Manzana INFO logs
+# Also keeps v0.1.1 fix:
+#   Redirect Manzana Rich Console logs to stderr so stdout stays clean.
 
 from __future__ import annotations
 
@@ -39,14 +40,11 @@ def _redirect_manzana_logs_to_stderr() -> None:
         from rich.console import Console
         import utils.logger as manzana_logger
 
-        # Replace Console to print to stderr
         manzana_logger.cons = Console(file=sys.stderr)
     except Exception:
-        # If rich or module not available, do nothing.
         pass
 
 
-# Redirect as early as possible (safe even if used in custom mode)
 _redirect_manzana_logs_to_stderr()
 
 
@@ -58,6 +56,12 @@ except Exception as e:
         "Unable to import Manzana modules. Run this script from repository root, "
         "or ensure repo is on PYTHONPATH."
     ) from e
+
+
+# --- Constants for resolution bands ---
+WIDTH_4K_MIN = 3500
+WIDTH_1080_MIN = 1800
+WIDTH_720_MIN = 1200
 
 
 def eprint(*args: Any) -> None:
@@ -144,8 +148,6 @@ def _video_sort_key(t: Dict[str, Any]) -> Tuple[int, int]:
 
 
 def _audio_sort_key(t: Dict[str, Any]) -> Tuple[int, int, str, str]:
-    # Mimic core/control.py sort:
-    # original first, AD last, then language, then channels
     return (
         0 if t.get("isOriginal") else 1,
         1 if t.get("isAD") else 0,
@@ -180,35 +182,42 @@ def _with_ids(
 
 
 def index_tracks(hls: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Create deterministic v/a/s ids matching the same logic used by -F output.
-    """
     vids = _with_ids(hls.get("video", []), "v", sort_key=_video_sort_key, reverse=True)
     auds = _with_ids(hls.get("audio", []), "a", sort_key=_audio_sort_key, reverse=False)
     subs = _with_ids(hls.get("subtitle", []), "s", sort_key=_sub_sort_key, reverse=False)
     return {"video": vids, "audio": auds, "subtitle": subs}
 
 
-def _is_width_at_least(track: Dict[str, Any], wmin: int) -> bool:
+def _track_width(track: Dict[str, Any]) -> int:
     res = track.get("resolution")
     if not res:
-        return False
+        return 0
     try:
         w, _h = res
-        return int(w) >= int(wmin)
+        return int(w)
     except Exception:
+        return 0
+
+
+def _in_width_band(track: Dict[str, Any], min_width: int, max_width_exclusive: Optional[int]) -> bool:
+    w = _track_width(track)
+    if w < min_width:
         return False
+    if max_width_exclusive is not None and w >= max_width_exclusive:
+        return False
+    return True
 
 
 def _select_best_video(
     tracks: List[Dict[str, Any]],
     *,
     want_range: str,
-    min_width: int
+    min_width: int,
+    max_width_exclusive: Optional[int]
 ) -> Optional[Dict[str, Any]]:
     cand = [
         t for t in tracks
-        if str(t.get("range")) == want_range and _is_width_at_least(t, min_width)
+        if str(t.get("range")) == want_range and _in_width_band(t, min_width, max_width_exclusive)
     ]
     if not cand:
         return None
@@ -216,25 +225,38 @@ def _select_best_video(
     return cand[0]
 
 
-def _select_video_with_fallback(video_tracks: List[Dict[str, Any]], primary: Tuple[str, int]) -> Dict[str, Any]:
+def _select_video_with_fallback_strict(
+    video_tracks: List[Dict[str, Any]],
+    primary: Tuple[str, int, Optional[int]]
+) -> Dict[str, Any]:
     """
-    Fallback chain (as per requirements):
-      - try primary (range,width)
-      - fallback to 1080 SDR
-      - fallback to ~720 SDR
+    Fallback chain:
+      - try primary (range, min_width, max_width_exclusive)
+      - fallback to 1080 SDR STRICT (1800 <= width < 3500)
+      - fallback to 720 SDR STRICT (1200 <= width < 1800)
       - hard error if nothing
     """
-    primary_range, primary_wmin = primary
+    primary_range, primary_minw, primary_maxw = primary
 
-    v = _select_best_video(video_tracks, want_range=primary_range, min_width=primary_wmin)
+    v = _select_best_video(video_tracks, want_range=primary_range, min_width=primary_minw, max_width_exclusive=primary_maxw)
     if v:
         return v
 
-    v1080 = _select_best_video(video_tracks, want_range="SDR", min_width=1800)
+    v1080 = _select_best_video(
+        video_tracks,
+        want_range="SDR",
+        min_width=WIDTH_1080_MIN,
+        max_width_exclusive=WIDTH_4K_MIN,
+    )
     if v1080:
         return v1080
 
-    v720 = _select_best_video(video_tracks, want_range="SDR", min_width=1200)
+    v720 = _select_best_video(
+        video_tracks,
+        want_range="SDR",
+        min_width=WIDTH_720_MIN,
+        max_width_exclusive=WIDTH_1080_MIN,
+    )
     if v720:
         return v720
 
@@ -271,10 +293,6 @@ def _best_audio_in_codec(
 
 
 def _best_audio_aac_original(audio_tracks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Compatibility-first fallback:
-      prefer AAC over HE-AAC, original language, highest bitrate.
-    """
     a = _best_audio_in_codec(audio_tracks, codec="AAC", lang=None, require_original=True)
     if a:
         return a
@@ -294,15 +312,6 @@ def _select_audio(
     audio_lang: str,
     fixed_codec: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    audio_quality:
-      - 'none' => return None
-      - 'AAC'/'Atmos'/'DD5.1'
-    audio_lang:
-      - 'original' or BCP-47 code (e.g. en, cmn-Hans)
-    fixed_codec:
-      - if set, ignore audio_quality and force this codec (for preset_av profiles)
-    """
     aq = (audio_quality or "").strip()
     al = (audio_lang or "").strip()
 
@@ -330,7 +339,6 @@ def _select_audio(
         want_lang = al
         require_original = False
 
-    # 1) try requested codec
     if require_original:
         a = _best_audio_in_codec(audio_tracks, codec=want_codec, lang=None, require_original=True)
     else:
@@ -339,7 +347,6 @@ def _select_audio(
     if a:
         return a
 
-    # 2) fallback to best original AAC (compat)
     return _best_audio_aac_original(audio_tracks)
 
 
@@ -352,7 +359,6 @@ def _select_subtitle(sub_tracks: List[Dict[str, Any]], sub_lang: str) -> Optiona
     if not cand:
         return None
 
-    # prefer Normal: not SDH, not forced
     def pref_key(t: Dict[str, Any]) -> Tuple[int, int]:
         return (1 if t.get("isSDH") else 0, 1 if t.get("isForced") else 0)
 
@@ -365,6 +371,7 @@ class PresetAVProfile:
     name: str
     want_video_range: str
     want_video_min_width: int
+    want_video_max_width_exclusive: Optional[int]
     fixed_audio_codec: str  # AAC / Atmos / DD5.1
 
 
@@ -373,44 +380,56 @@ class PresetVideoProfile:
     name: str
     primary_video_range: str
     primary_video_min_width: int
+    primary_video_max_width_exclusive: Optional[int]
 
 
+# Preset AV profiles:
+# - 1080_SDR_AAC is STRICT 1080 (exclude 4K)
+# - 4K profiles target width >= 3500 (no upper bound)
 PRESET_AV_PROFILES: Dict[str, PresetAVProfile] = {
     "1080_SDR_AAC": PresetAVProfile(
-        name="1080p SDR + AAC (best bitrate, original)",
+        name="1080p SDR + AAC (best bitrate, original) [STRICT 1080]",
         want_video_range="SDR",
-        want_video_min_width=1800,
+        want_video_min_width=WIDTH_1080_MIN,
+        want_video_max_width_exclusive=WIDTH_4K_MIN,
         fixed_audio_codec="AAC",
     ),
     "4K_DOVI_ATMOS": PresetAVProfile(
         name="4K DoVi + Atmos (best bitrate, original)",
         want_video_range="DoVi",
-        want_video_min_width=3500,
+        want_video_min_width=WIDTH_4K_MIN,
+        want_video_max_width_exclusive=None,
         fixed_audio_codec="Atmos",
     ),
     "4K_HDR_DD51": PresetAVProfile(
         name="4K HDR + DD5.1 (best bitrate, original)",
         want_video_range="HDR",
-        want_video_min_width=3500,
+        want_video_min_width=WIDTH_4K_MIN,
+        want_video_max_width_exclusive=None,
         fixed_audio_codec="DD5.1",
     ),
 }
 
+# Preset video profiles:
+# - 1080_SDR is STRICT 1080 (exclude 4K SDR)
 PRESET_VIDEO_PROFILES: Dict[str, PresetVideoProfile] = {
     "1080_SDR": PresetVideoProfile(
-        name="1080p SDR (best bitrate)",
+        name="1080p SDR (best bitrate) [STRICT 1080]",
         primary_video_range="SDR",
-        primary_video_min_width=1800,
+        primary_video_min_width=WIDTH_1080_MIN,
+        primary_video_max_width_exclusive=WIDTH_4K_MIN,
     ),
     "4K_DOVI": PresetVideoProfile(
         name="4K DoVi (best bitrate)",
         primary_video_range="DoVi",
-        primary_video_min_width=3500,
+        primary_video_min_width=WIDTH_4K_MIN,
+        primary_video_max_width_exclusive=None,
     ),
     "4K_HDR": PresetVideoProfile(
         name="4K HDR (best bitrate)",
         primary_video_range="HDR",
-        primary_video_min_width=3500,
+        primary_video_min_width=WIDTH_4K_MIN,
+        primary_video_max_width_exclusive=None,
     ),
 }
 
@@ -435,10 +454,6 @@ def _fetch_trailer_item(url: str, *, trailer_idx: int, default_only: bool) -> Di
 
 
 def _select_effective_format_custom(expr: str) -> str:
-    """
-    For mode=custom. Lightweight sanity check.
-    Must include exactly one vN. Empty means "list-only" in workflow.
-    """
     if not expr or not expr.strip():
         return ""
 
@@ -468,7 +483,11 @@ def _select_preset_av(
     auds = indexed["audio"]
     subs = indexed["subtitle"]
 
-    v = _select_video_with_fallback(vids, (prof.want_video_range, prof.want_video_min_width))
+    # Strict selection for profile, with strict SDR fallbacks:
+    v = _select_video_with_fallback_strict(
+        vids,
+        (prof.want_video_range, prof.want_video_min_width, prof.want_video_max_width_exclusive),
+    )
 
     a = _select_audio(auds, audio_quality="ignored", audio_lang=audio_lang, fixed_codec=prof.fixed_audio_codec)
     if a is None:
@@ -506,7 +525,10 @@ def _select_preset_video(
     auds = indexed["audio"]
     subs = indexed["subtitle"]
 
-    v = _select_video_with_fallback(vids, (prof.primary_video_range, prof.primary_video_min_width))
+    v = _select_video_with_fallback_strict(
+        vids,
+        (prof.primary_video_range, prof.primary_video_min_width, prof.primary_video_max_width_exclusive),
+    )
 
     a = _select_audio(auds, audio_quality=audio_quality, audio_lang=audio_lang, fixed_codec=None)
     s = _select_subtitle(subs, sub_lang)
@@ -531,32 +553,25 @@ def _select_preset_video(
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(
-        description="Select Manzana -f format string for preset/custom workflow modes."
-    )
+    p = argparse.ArgumentParser(description="Select Manzana -f format string for preset/custom workflow modes.")
 
     p.add_argument("--url", required=True, help="Apple TV page URL")
     p.add_argument("--trailer", default="t0", help='Trailer selector (t0, t1, ...). "all" is not supported in presets v0.1.x')
     p.add_argument("--default-only", action="store_true", help="Use Manzana --default logic (default background video)")
     p.add_argument("--mode", required=True, choices=["preset_av", "preset_video", "custom"], help="Selection mode")
 
-    # preset_av
     p.add_argument("--preset-av-profile", default="1080_SDR_AAC", help="Preset AV profile key")
-    # preset_video
     p.add_argument("--preset-video-profile", default="1080_SDR", help="Preset video profile key")
     p.add_argument("--audio-quality", default="AAC", help="AAC/Atmos/DD5.1/none (only used in preset_video)")
-    # preset_* optional
     p.add_argument("--audio-lang", default="original", help='Audio language: "original" or language code (e.g. en, cmn-Hans)')
     p.add_argument("--sub-lang", default="none", help='Subtitle language code or "none"')
 
-    # custom
     p.add_argument("--custom-format", default="", help='Custom -f expression, e.g. "v6+a0+s4"')
 
     args = p.parse_args(argv)
 
     trailer_idx = _parse_trailer_arg(args.trailer)
 
-    # custom mode: we don't need to fetch tracks if format is empty (meaning list-only)
     if args.mode == "custom":
         eff = _select_effective_format_custom(args.custom_format)
         print(eff)
