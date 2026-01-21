@@ -1,14 +1,14 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.6.3
-# Changes vs v1.6.2:
-# - Phase 1 (-F) is rewritten to avoid duplicated format listings (including artifact formats.txt),
-#   especially when API count<=1 and movie t0 equals clip[0].
-#   Rules:
-#     * trailer=all + count>1  => list -F for each trailer t0..tN-1 (no "all -F")
-#     * trailer=all + count<=1 => list -F for each clip URL ONLY (do NOT list movie t0)
-#     * trailer=tN             => list -F for that trailer only
-# - Keep v1.6.2 features:
+# .github/workflows/manzana-download.yml @ v1.6.4
+# Changes vs v1.6.3:
+# - When clip fallback is used (COUNT<=1), call:
+#     tools/list_clip_urls.py --resolve-titles
+#   so Actions logs show human-readable clip names (e.g. 吹替版/字幕版) during:
+#     * Phase 1 (optional visibility)
+#     * Compute EFFECTIVE_FORMAT / PLAN (main visibility)
+# - All other behavior stays the same as v1.6.3:
+#     * Phase 1 -F dedup (no duplicated listings)
 #     * custom mode supports trailer=all expansion (trailers or clip fallback)
 #     * preset modes support clip fallback when API list is incomplete
 #     * continue-on-failure semantics for downloads (warn summary, all-fail -> exit 1)
@@ -224,21 +224,18 @@ jobs:
             DEFAULT_FLAG="--default-only"
           fi
 
-          # default_only: always list only the default video once (no expansion)
           if [[ "$DEFAULT_ONLY" == "true" ]]; then
             echo "========== DEFAULT (single) ==========" | tee -a formats.txt
             python manzana.py --default --no-prompt --trailer "$TRAILER" -F "$URL" | tee -a formats.txt
             exit 0
           fi
 
-          # trailer != all: list exactly one trailer once
           if ! [[ "$TRAILER" =~ ^(all|a)$ ]]; then
             echo "========== TRAILER $TRAILER ==========" | tee -a formats.txt
             python manzana.py --no-prompt --trailer "$TRAILER" -F "$URL" | tee -a formats.txt
             exit 0
           fi
 
-          # trailer = all: build unique item list
           COUNT="$(python tools/list_trailers.py --url "$URL" $DEFAULT_FLAG | tail -n 1 | tr -d '\r\n')"
           if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
             echo "::warning::Unable to parse trailer count for Phase 1; falling back to listing t0 only."
@@ -257,10 +254,10 @@ jobs:
             exit 0
           fi
 
-          # COUNT <= 1: DO NOT list movie t0 (it is often the same as clip[0]).
-          # Instead, list each clip URL once (dedup).
           echo "========== ALL (clip fallback) ==========" | tee -a formats.txt
-          mapfile -t CLIPS_RAW < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG)
+
+          # v1.6.4: --resolve-titles (stderr only) so Actions logs show clip names
+          mapfile -t CLIPS_RAW < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG --resolve-titles)
 
           if [[ ${#CLIPS_RAW[@]} -le 0 ]]; then
             echo "::warning::Clip fallback found 0 clip URLs. Listing trailer t0 as last resort." | tee -a formats.txt
@@ -269,7 +266,6 @@ jobs:
             exit 0
           fi
 
-          # Dedup clip URLs (extra safety)
           declare -A seen=()
           CLIPS=()
           for c in "${CLIPS_RAW[@]}"; do
@@ -289,7 +285,6 @@ jobs:
           for clip_url in "${CLIPS[@]}"; do
             echo "" | tee -a formats.txt
             echo "========== CLIP: $clip_url ==========" | tee -a formats.txt
-            # For clip pages, always use trailer=t0
             python manzana.py --no-prompt --trailer t0 -F "$clip_url" | tee -a formats.txt
           done
 
@@ -338,7 +333,6 @@ jobs:
 
             echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
 
-            # custom + trailer=all: expand plan (trailers or clip fallback)
             if [[ "$TRAILER" =~ ^(all|a)$ ]]; then
               COUNT="$(python tools/list_trailers.py --url "$URL" $DEFAULT_FLAG | tail -n 1 | tr -d '\r\n')"
               if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
@@ -364,7 +358,8 @@ jobs:
               echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
               echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
 
-              mapfile -t CLIPS < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG)
+              # v1.6.4: --resolve-titles prints names to stderr for better logs
+              mapfile -t CLIPS < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG --resolve-titles)
               if [[ ${#CLIPS[@]} -le 0 ]]; then
                 echo "::error::Clip fallback found 0 clip URLs. Unable to continue."
                 exit 1
@@ -383,7 +378,6 @@ jobs:
               exit 0
             fi
 
-            # custom single
             echo "EFFECTIVE_FORMAT=$F" >> "$GITHUB_ENV"
             echo "DOWNLOAD_ALL=false" >> "$GITHUB_ENV"
             echo "PLAN_KIND=single" >> "$GITHUB_ENV"
@@ -400,8 +394,6 @@ jobs:
                 exit 1
               fi
 
-              # If API provides >1 trailers, use t0..tN-1 (existing behavior).
-              # If API provides <=1, fallback to clip URLs extracted from HTML.
               if [[ "$COUNT" -gt 1 ]]; then
                 echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
                 echo "PLAN_KIND=trailers" >> "$GITHUB_ENV"
@@ -462,7 +454,8 @@ jobs:
                 echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
                 echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
 
-                mapfile -t CLIPS < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG)
+                # v1.6.4: --resolve-titles prints names to stderr for better logs
+                mapfile -t CLIPS < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG --resolve-titles)
 
                 if [[ ${#CLIPS[@]} -le 0 ]]; then
                   echo "::error::Clip fallback found 0 clip URLs. Unable to continue."
@@ -478,7 +471,6 @@ jobs:
                     continue
                   fi
 
-                  # For clip pages, treat it as its own page and always use trailer=t0
                   set +e
                   if [[ "$MODE" == "preset_av" ]]; then
                     EFF="$(python tools/select_format.py \
