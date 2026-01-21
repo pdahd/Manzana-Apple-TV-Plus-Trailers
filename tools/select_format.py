@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
-# tools/select_format.py @ v0.1.2
+# tools/select_format.py @ v0.1.3
 #
-# Fix in v0.1.2:
-#   Make "1080" presets STRICT:
-#     - Do NOT allow 4K SDR to satisfy 1080 preset.
-#     - 1080 band: 1800 <= width < 3500
-#     - 720 band fallback: 1200 <= width < 1800
-#     - 4K band: width >= 3500 (no upper bound)
+# Fix in v0.1.3 (Best scheme agreed):
+#   Define resolution "bands" to make 1080 presets truly pick the FHD-width ladder
+#   and avoid picking mid/3K variants like 2966x1240.
 #
-# Also keeps v0.1.1 fix:
-#   Redirect Manzana Rich Console logs to stderr so stdout stays clean.
+#   Bands (by width):
+#     - UHD (4K-width):        width >= 3500
+#     - FHD (our "1080"):      1700 <= width < 2200   (covers 1918/1920 and allows 2048)
+#     - HD (our "720-like"):   1100 <= width < 1700   (covers 1482, 1186, etc.)
+#     - SD (last resort):       700 <= width < 1100   (covers 862, 890, etc.)
+#
+#   Preset behavior:
+#     - preset_video_profile=1080_SDR:
+#         pick best SDR in FHD band; if none -> best SDR in HD band; if none -> best SDR in SD band; else error.
+#     - preset_video_profile=4K_DOVI / 4K_HDR:
+#         pick best DoVi/HDR in UHD band; if none -> fallback chain to SDR FHD -> SDR HD -> SDR SD -> error.
+#     - preset_av_profile=1080_SDR_AAC:
+#         same video band logic as 1080_SDR (FHD SDR), with same fallback chain.
+#
+# Keeps v0.1.1 fix:
+#   Redirect Manzana Rich Console logs to stderr so selector stdout stays clean.
+#
+# Output:
+#   - stdout: ONLY the effective format string (e.g. v6+a0+s4) or "" (custom empty)
+#   - stderr: selection explanation + Manzana INFO logs
 
 from __future__ import annotations
 
@@ -58,10 +73,17 @@ except Exception as e:
     ) from e
 
 
-# --- Constants for resolution bands ---
-WIDTH_4K_MIN = 3500
-WIDTH_1080_MIN = 1800
-WIDTH_720_MIN = 1200
+# --- Resolution bands (by width) ---
+WIDTH_UHD_MIN = 3500
+
+WIDTH_FHD_MIN = 1700
+WIDTH_FHD_MAX_EXCL = 2200
+
+WIDTH_HD_MIN = 1100
+WIDTH_HD_MAX_EXCL = 1700
+
+WIDTH_SD_MIN = 700
+WIDTH_SD_MAX_EXCL = 1100
 
 
 def eprint(*args: Any) -> None:
@@ -225,42 +247,57 @@ def _select_best_video(
     return cand[0]
 
 
-def _select_video_with_fallback_strict(
+def _select_video_with_band_fallback(
     video_tracks: List[Dict[str, Any]],
-    primary: Tuple[str, int, Optional[int]]
+    primary: Tuple[str, int, Optional[int]],
 ) -> Dict[str, Any]:
     """
     Fallback chain:
-      - try primary (range, min_width, max_width_exclusive)
-      - fallback to 1080 SDR STRICT (1800 <= width < 3500)
-      - fallback to 720 SDR STRICT (1200 <= width < 1800)
+      - try primary
+      - fallback to SDR in FHD band (1700-2200)
+      - fallback to SDR in HD band  (1100-1700)
+      - fallback to SDR in SD band  (700-1100)
       - hard error if nothing
     """
     primary_range, primary_minw, primary_maxw = primary
 
-    v = _select_best_video(video_tracks, want_range=primary_range, min_width=primary_minw, max_width_exclusive=primary_maxw)
+    v = _select_best_video(
+        video_tracks,
+        want_range=primary_range,
+        min_width=primary_minw,
+        max_width_exclusive=primary_maxw,
+    )
     if v:
         return v
 
-    v1080 = _select_best_video(
+    v_fhd = _select_best_video(
         video_tracks,
         want_range="SDR",
-        min_width=WIDTH_1080_MIN,
-        max_width_exclusive=WIDTH_4K_MIN,
+        min_width=WIDTH_FHD_MIN,
+        max_width_exclusive=WIDTH_FHD_MAX_EXCL,
     )
-    if v1080:
-        return v1080
+    if v_fhd:
+        return v_fhd
 
-    v720 = _select_best_video(
+    v_hd = _select_best_video(
         video_tracks,
         want_range="SDR",
-        min_width=WIDTH_720_MIN,
-        max_width_exclusive=WIDTH_1080_MIN,
+        min_width=WIDTH_HD_MIN,
+        max_width_exclusive=WIDTH_HD_MAX_EXCL,
     )
-    if v720:
-        return v720
+    if v_hd:
+        return v_hd
 
-    die("No suitable SDR video found (need at least ~720p SDR).")
+    v_sd = _select_best_video(
+        video_tracks,
+        want_range="SDR",
+        min_width=WIDTH_SD_MIN,
+        max_width_exclusive=WIDTH_SD_MAX_EXCL,
+    )
+    if v_sd:
+        return v_sd
+
+    die("No suitable SDR video found (need at least an SD ladder).")
 
 
 def _audio_bps(t: Dict[str, Any]) -> int:
@@ -384,51 +421,51 @@ class PresetVideoProfile:
 
 
 # Preset AV profiles:
-# - 1080_SDR_AAC is STRICT 1080 (exclude 4K)
+# - 1080_SDR_AAC uses STRICT FHD band (1700-2200)
 # - 4K profiles target width >= 3500 (no upper bound)
 PRESET_AV_PROFILES: Dict[str, PresetAVProfile] = {
     "1080_SDR_AAC": PresetAVProfile(
-        name="1080p SDR + AAC (best bitrate, original) [STRICT 1080]",
+        name="1080 (FHD-width) SDR + AAC (best bitrate, original) [BAND: 1700-2200]",
         want_video_range="SDR",
-        want_video_min_width=WIDTH_1080_MIN,
-        want_video_max_width_exclusive=WIDTH_4K_MIN,
+        want_video_min_width=WIDTH_FHD_MIN,
+        want_video_max_width_exclusive=WIDTH_FHD_MAX_EXCL,
         fixed_audio_codec="AAC",
     ),
     "4K_DOVI_ATMOS": PresetAVProfile(
         name="4K DoVi + Atmos (best bitrate, original)",
         want_video_range="DoVi",
-        want_video_min_width=WIDTH_4K_MIN,
+        want_video_min_width=WIDTH_UHD_MIN,
         want_video_max_width_exclusive=None,
         fixed_audio_codec="Atmos",
     ),
     "4K_HDR_DD51": PresetAVProfile(
         name="4K HDR + DD5.1 (best bitrate, original)",
         want_video_range="HDR",
-        want_video_min_width=WIDTH_4K_MIN,
+        want_video_min_width=WIDTH_UHD_MIN,
         want_video_max_width_exclusive=None,
         fixed_audio_codec="DD5.1",
     ),
 }
 
 # Preset video profiles:
-# - 1080_SDR is STRICT 1080 (exclude 4K SDR)
+# - 1080_SDR uses STRICT FHD band (1700-2200)
 PRESET_VIDEO_PROFILES: Dict[str, PresetVideoProfile] = {
     "1080_SDR": PresetVideoProfile(
-        name="1080p SDR (best bitrate) [STRICT 1080]",
+        name="1080 (FHD-width) SDR (best bitrate) [BAND: 1700-2200]",
         primary_video_range="SDR",
-        primary_video_min_width=WIDTH_1080_MIN,
-        primary_video_max_width_exclusive=WIDTH_4K_MIN,
+        primary_video_min_width=WIDTH_FHD_MIN,
+        primary_video_max_width_exclusive=WIDTH_FHD_MAX_EXCL,
     ),
     "4K_DOVI": PresetVideoProfile(
         name="4K DoVi (best bitrate)",
         primary_video_range="DoVi",
-        primary_video_min_width=WIDTH_4K_MIN,
+        primary_video_min_width=WIDTH_UHD_MIN,
         primary_video_max_width_exclusive=None,
     ),
     "4K_HDR": PresetVideoProfile(
         name="4K HDR (best bitrate)",
         primary_video_range="HDR",
-        primary_video_min_width=WIDTH_4K_MIN,
+        primary_video_min_width=WIDTH_UHD_MIN,
         primary_video_max_width_exclusive=None,
     ),
 }
@@ -483,8 +520,7 @@ def _select_preset_av(
     auds = indexed["audio"]
     subs = indexed["subtitle"]
 
-    # Strict selection for profile, with strict SDR fallbacks:
-    v = _select_video_with_fallback_strict(
+    v = _select_video_with_band_fallback(
         vids,
         (prof.want_video_range, prof.want_video_min_width, prof.want_video_max_width_exclusive),
     )
@@ -525,7 +561,7 @@ def _select_preset_video(
     auds = indexed["audio"]
     subs = indexed["subtitle"]
 
-    v = _select_video_with_fallback_strict(
+    v = _select_video_with_band_fallback(
         vids,
         (prof.primary_video_range, prof.primary_video_min_width, prof.primary_video_max_width_exclusive),
     )
