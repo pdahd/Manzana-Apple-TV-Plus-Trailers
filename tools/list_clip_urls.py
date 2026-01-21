@@ -1,24 +1,12 @@
 #!/usr/bin/env python3
-# tools/list_clip_urls.py @ v0.1.0
+# tools/list_clip_urls.py @ v0.1.1
 #
-# Purpose:
-#   Extract clip URLs from a movie page (HTML) as a fallback for "trailer=all"
-#   when the UTS API only returns 1 trailer (common on older pages / storefront mismatch).
-#
-# How it works:
-#   - Derive movie content id from URL path: last segment like "umc.cmc.xxxxx"
-#   - Download the movie page HTML
-#   - Extract <a href="..."> values containing:
-#       /clip/  AND  targetId=<movie_id>  AND  targetType=Movie
-#   - Output one absolute URL per line to stdout (deduplicated, stable order)
-#
-# Output:
-#   - stdout: clip URLs only (one per line)
-#   - stderr: info/debug lines
-#
-# Notes:
-#   - This does not currently distinguish "Trailers" vs "Bonus Content".
-#     It returns all clip URLs found for that movie targetId in the HTML.
+# v0.1.1 changes:
+# - Add --resolve-titles:
+#     Resolve each clip's (title, videoTitle) and print to stderr so Actions logs
+#     show human-readable names (e.g. 吹替版 / 字幕版) during clip fallback.
+#   stdout remains URLs only (one per line) to keep workflow capture clean.
+# - Redirect Manzana Rich Console logs to stderr (avoid stdout pollution).
 
 from __future__ import annotations
 
@@ -31,6 +19,25 @@ from typing import Any, List, Optional
 from urllib.parse import urlparse, urljoin
 
 import requests
+
+
+# --- Make repo root importable ---
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+
+def _redirect_manzana_logs_to_stderr() -> None:
+    try:
+        from rich.console import Console
+        import utils.logger as manzana_logger
+
+        manzana_logger.cons = Console(file=sys.stderr)
+    except Exception:
+        pass
+
+
+_redirect_manzana_logs_to_stderr()
 
 
 def eprint(*args: Any) -> None:
@@ -54,7 +61,6 @@ def _movie_id_from_url(url: str) -> str:
     if last.startswith("umc.cmc."):
         return last
 
-    # Sometimes last segment may include something else; try to find the first umc.cmc.* from the end
     for p in reversed(parts):
         if p.startswith("umc.cmc."):
             return p
@@ -72,7 +78,6 @@ def _fetch_html(url: str) -> str:
     try:
         r = requests.get(url, headers=headers, timeout=30)
     except Exception:
-        # fallback without SSL verify
         r = requests.get(url, headers=headers, timeout=30, verify=False)
 
     if r.status_code != 200:
@@ -82,10 +87,6 @@ def _fetch_html(url: str) -> str:
 
 
 def _extract_clip_hrefs(html: str, base_url: str, movie_id: str) -> List[str]:
-    """
-    Extract href="..." values from HTML and filter clip URLs for this movie_id.
-    """
-    # Simple, robust-enough href extraction (works even without a full DOM parser)
     hrefs = re.findall(r'href="([^"]+)"', html, flags=re.IGNORECASE)
     out: List[str] = []
     seen = set()
@@ -93,7 +94,6 @@ def _extract_clip_hrefs(html: str, base_url: str, movie_id: str) -> List[str]:
     for raw in hrefs:
         raw = html_mod.unescape(raw)
 
-        # Quick filter
         if "/clip/" not in raw:
             continue
         if f"targetId={movie_id}" not in raw:
@@ -101,10 +101,7 @@ def _extract_clip_hrefs(html: str, base_url: str, movie_id: str) -> List[str]:
         if "targetType=Movie" not in raw:
             continue
 
-        abs_url = urljoin(base_url, raw)
-
-        # Normalize: remove trailing spaces
-        abs_url = abs_url.strip()
+        abs_url = urljoin(base_url, raw).strip()
 
         if abs_url not in seen:
             seen.add(abs_url)
@@ -113,15 +110,69 @@ def _extract_clip_hrefs(html: str, base_url: str, movie_id: str) -> List[str]:
     return out
 
 
+def _resolve_title_via_api(atvp, clip_url: str) -> Optional[tuple[str, str]]:
+    """
+    Try to resolve (title, videoTitle) via core/api/aptv.py.
+    Returns None if failed.
+    """
+    try:
+        items = atvp.get_info(clip_url, default=False)
+        if not items or not isinstance(items, list):
+            return None
+        it = items[0] or {}
+        t = str(it.get("title") or "").strip()
+        vt = str(it.get("videoTitle") or "").strip()
+        if t or vt:
+            return (t, vt)
+        return None
+    except Exception:
+        return None
+
+
+def _resolve_title_via_html(clip_url: str) -> Optional[tuple[str, str]]:
+    """
+    Best-effort: fetch clip HTML and read og:title / <title>.
+    Usually looks like: "GODZILLA ゴジラ(字幕版) - Apple TV+"
+    We'll return ("" , og_title_or_title) if found.
+    """
+    try:
+        html = _fetch_html(clip_url)
+    except Exception:
+        return None
+
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+        soup = BeautifulSoup(html, "html.parser")
+
+        og = soup.find("meta", attrs={"property": "og:title"})
+        if og and og.get("content"):
+            s = str(og.get("content")).strip()
+            if s:
+                return ("", s)
+
+        tit = soup.find("title")
+        if tit and tit.text:
+            s = str(tit.text).strip()
+            if s:
+                return ("", s)
+    except Exception:
+        return None
+
+    return None
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="List clip URLs for a movie page (stdout = urls, one per line).")
     p.add_argument("--url", required=True, help="Apple TV movie page URL")
     p.add_argument("--default-only", action="store_true", help="If set, treat as only default content (no clip fallback needed).")
+    p.add_argument(
+        "--resolve-titles",
+        action="store_true",
+        help="Resolve each clip's title/videoTitle and print to stderr (stdout still URLs only).",
+    )
     args = p.parse_args(argv)
 
     if args.default_only:
-        # In default-only mode, caller usually wants only the default background video.
-        # Returning no clips makes the workflow stay on API path / single item behavior.
         eprint("[list_clip_urls] default_only=true -> returning 0 clip urls")
         return 0
 
@@ -142,7 +193,36 @@ def main(argv: Optional[List[str]] = None) -> int:
     for i, c in enumerate(clips):
         eprint(f"[list_clip_urls] clip[{i}]: {c}")
 
-    # stdout: one URL per line
+    # Optional: resolve titles for better logs
+    if args.resolve_titles and clips:
+        try:
+            from core.api.aptv import AppleTVPlus
+            atvp = AppleTVPlus()
+        except Exception:
+            atvp = None
+
+        for i, clip_url in enumerate(clips):
+            title = ""
+            video_title = ""
+
+            if atvp is not None:
+                got = _resolve_title_via_api(atvp, clip_url)
+                if got:
+                    title, video_title = got
+
+            if (not title and not video_title):
+                got2 = _resolve_title_via_html(clip_url)
+                if got2:
+                    title, video_title = got2
+
+            if title or video_title:
+                # Prefer showing videoTitle (it usually contains 吹替版/字幕版)
+                show = video_title or title
+                eprint(f"[list_clip_urls] name[{i}]: {show}")
+            else:
+                eprint(f"[list_clip_urls] name[{i}]: (unresolved)")
+
+    # stdout: one URL per line (clean)
     for c in clips:
         print(c)
 
