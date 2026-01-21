@@ -1,10 +1,13 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.6.1
-# Changes vs v1.6.0:
-# - Add clip fallback for preset+trailer=all when API trailer count <= 1:
-#   - tools/list_clip_urls.py extracts /clip/ URLs from movie page HTML
-#   - For each clip URL, treat it as its own page: selector + download with trailer=t0
+# .github/workflows/manzana-download.yml @ v1.6.2
+# Changes vs v1.6.1:
+# - custom mode now supports trailer=all expansion:
+#     - if API trailers count > 1: loop t0..tN with the same custom -f
+#     - if count <= 1: clip fallback loop (each clip URL uses trailer=t0 with the same -f)
+# - Phase 1 (-F) formats.txt:
+#     - when trailer=all and API count <= 1: also list formats for each clip URL (append),
+#       so users can see there are multiple playable items even if API trailers list is incomplete.
 # - Keep fail_fast=false behavior: continue on failures, warn summary, all-fail -> exit 1
 
 on:
@@ -16,7 +19,7 @@ on:
         type: string
 
       trailer:
-        description: 'Trailer selector: use t0, t1, t2... (e.g. "t0") or "all". In preset modes, "all" will apply presets to each trailer (or clip fallback when API list is incomplete).'
+        description: 'Trailer selector: use t0, t1, t2... (e.g. "t0") or "all". In preset modes, "all" will apply presets to each trailer (or clip fallback when API list is incomplete). In custom mode, "all" will loop items with the same format (may fail if IDs differ).'
         required: false
         default: "t0"
         type: string
@@ -205,11 +208,66 @@ jobs:
 
       - name: Phase 1 - List formats (-F) and save to formats.txt
         run: |
-          if [ "${{ inputs.default_only }}" = "true" ]; then
-            python manzana.py --default --no-prompt --trailer "${{ inputs.trailer }}" -F "${{ inputs.url }}" | tee formats.txt
-          else
-            python manzana.py --no-prompt --trailer "${{ inputs.trailer }}" -F "${{ inputs.url }}" | tee formats.txt
+          set -euo pipefail
+
+          URL="${{ inputs.url }}"
+          TRAILER="${{ inputs.trailer }}"
+          DEFAULT_ONLY="${{ inputs.default_only }}"
+
+          rm -f formats.txt
+
+          if [[ "$DEFAULT_ONLY" == "true" ]]; then
+            python manzana.py --default --no-prompt --trailer "$TRAILER" -F "$URL" | tee formats.txt
+            exit 0
           fi
+
+          if [[ "$TRAILER" =~ ^(all|a)$ ]]; then
+            COUNT="$(python tools/list_trailers.py --url "$URL" | tail -n 1 | tr -d '\r\n')"
+            if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
+              echo "::warning::Unable to parse trailer count for Phase 1; falling back to plain -F on page."
+              python manzana.py --no-prompt --trailer "$TRAILER" -F "$URL" | tee formats.txt
+              exit 0
+            fi
+
+            if [[ "$COUNT" -gt 1 ]]; then
+              # API already gives multiple trailers; list as usual
+              python manzana.py --no-prompt --trailer "$TRAILER" -F "$URL" | tee formats.txt
+              exit 0
+            fi
+
+            # count <= 1: still list page t0, but also append each clip's -F output
+            python manzana.py --no-prompt --trailer t0 -F "$URL" | tee formats.txt
+
+            echo "" >> formats.txt
+            echo "===============================" >> formats.txt
+            echo "Phase 1 NOTE: API count<=1, listing clip URLs formats (-F) below" >> formats.txt
+            echo "===============================" >> formats.txt
+            echo "" >> formats.txt
+
+            mapfile -t CLIPS < <(python tools/list_clip_urls.py --url "$URL")
+
+            if [[ ${#CLIPS[@]} -le 0 ]]; then
+              echo "::warning::Clip fallback found 0 clip URLs (Phase 1)."
+              exit 0
+            fi
+
+            for clip_url in "${CLIPS[@]}"; do
+              clip_url="$(printf "%s" "$clip_url" | tr -d '\r\n')"
+              if [[ -z "$clip_url" ]]; then
+                continue
+              fi
+              echo "" >> formats.txt
+              echo "========== CLIP: $clip_url ==========" >> formats.txt
+              echo "" >> formats.txt
+              # For clip pages, always use trailer=t0
+              python manzana.py --no-prompt --trailer t0 -F "$clip_url" >> formats.txt
+            done
+
+            exit 0
+          fi
+
+          # Normal case (t0/t1/..)
+          python manzana.py --no-prompt --trailer "$TRAILER" -F "$URL" | tee formats.txt
 
       - name: Upload formats as artifact (manzana-formats)
         uses: actions/upload-artifact@v4
@@ -245,17 +303,68 @@ jobs:
             fi
             F="$(printf "%s" "$F" | tr -d '\r\n')"
 
+            if [[ -z "$F" ]]; then
+              echo "EFFECTIVE_FORMAT=" >> "$GITHUB_ENV"
+              echo "DO_DOWNLOAD=false" >> "$GITHUB_ENV"
+              echo "DOWNLOAD_ALL=false" >> "$GITHUB_ENV"
+              echo "PLAN_KIND=single" >> "$GITHUB_ENV"
+              echo "mode=custom: format empty -> list only, no download."
+              exit 0
+            fi
+
+            echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
+
+            # custom + trailer=all: expand plan (trailers or clip fallback)
+            if [[ "$TRAILER" =~ ^(all|a)$ ]]; then
+              COUNT="$(python tools/list_trailers.py --url "$URL" $DEFAULT_FLAG | tail -n 1 | tr -d '\r\n')"
+              if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
+                echo "::error::Unable to parse trailer count: '$COUNT'"
+                exit 1
+              fi
+
+              if [[ "$COUNT" -gt 1 ]]; then
+                echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
+                echo "PLAN_KIND=trailers" >> "$GITHUB_ENV"
+                echo "::notice::custom mode + trailer=all -> API trailers count=$COUNT (t0..t$((COUNT-1))). Using the SAME format for each."
+
+                for ((i=0;i<COUNT;i++)); do
+                  echo "t${i} $F" >> "$PLAN_FILE"
+                done
+
+                echo "::notice::Computed plan (trailer -> format):"
+                cat "$PLAN_FILE"
+                exit 0
+              fi
+
+              echo "::notice::custom mode + trailer=all -> API count=$COUNT (<=1). Falling back to clip URLs from HTML..."
+              echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
+              echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
+
+              mapfile -t CLIPS < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG)
+              if [[ ${#CLIPS[@]} -le 0 ]]; then
+                echo "::error::Clip fallback found 0 clip URLs. Unable to continue."
+                exit 1
+              fi
+
+              for clip_url in "${CLIPS[@]}"; do
+                clip_url="$(printf "%s" "$clip_url" | tr -d '\r\n')"
+                if [[ -z "$clip_url" ]]; then
+                  continue
+                fi
+                echo "$clip_url $F" >> "$PLAN_FILE"
+              done
+
+              echo "::notice::Computed plan (clip_url -> format):"
+              cat "$PLAN_FILE"
+              exit 0
+            fi
+
+            # custom single
             echo "EFFECTIVE_FORMAT=$F" >> "$GITHUB_ENV"
             echo "DOWNLOAD_ALL=false" >> "$GITHUB_ENV"
             echo "PLAN_KIND=single" >> "$GITHUB_ENV"
-
-            if [[ -z "$F" ]]; then
-              echo "DO_DOWNLOAD=false" >> "$GITHUB_ENV"
-              echo "mode=custom: format empty -> list only, no download."
-            else
-              echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
-              echo "mode=custom: will download with format: $F"
-            fi
+            echo "mode=custom: will download with format: $F"
+            exit 0
 
           elif [[ "$MODE" == "preset_av" || "$MODE" == "preset_video" ]]; then
             echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
@@ -329,7 +438,6 @@ jobs:
                 echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
                 echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
 
-                # list_clip_urls prints one URL per line (stdout), logs to stderr
                 mapfile -t CLIPS < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG)
 
                 if [[ ${#CLIPS[@]} -le 0 ]]; then
@@ -346,7 +454,7 @@ jobs:
                     continue
                   fi
 
-                  # For clip pages, treat as its own page and always use trailer=t0
+                  # For clip pages, treat it as its own page and always use trailer=t0
                   set +e
                   if [[ "$MODE" == "preset_av" ]]; then
                     EFF="$(python tools/select_format.py \
@@ -379,7 +487,6 @@ jobs:
                     continue
                   fi
 
-                  # store: <clip_url> <format>
                   echo "$clip_url $EFF" >> "$PLAN_FILE"
                 done
 
@@ -473,7 +580,7 @@ jobs:
           command -v MP4Box
           MP4Box -version || true
 
-      - name: Phase 2 - Download (custom single / preset single / preset all + clip fallback)
+      - name: Phase 2 - Download (custom single / custom all / preset single / preset all + clip fallback)
         if: ${{ env.DO_DOWNLOAD == 'true' }}
         env:
           PYTHONUNBUFFERED: "1"
@@ -497,61 +604,53 @@ jobs:
           failures=()
           success_count=0
 
-          if [[ "$MODE" == "custom" ]]; then
-            echo "Using custom EFFECTIVE_FORMAT=$EFF"
-            python manzana.py "${default_args[@]}" --no-prompt --trailer "$TRAILER" -f "$EFF" "$URL"
-            success_count=1
+          if [[ "$DOWNLOAD_ALL" == "true" ]]; then
+            if [[ ! -s "$PLAN_FILE" ]]; then
+              echo "::error::Plan file missing or empty: $PLAN_FILE"
+              exit 1
+            fi
 
-          else
-            if [[ "$DOWNLOAD_ALL" == "true" ]]; then
-              if [[ ! -s "$PLAN_FILE" ]]; then
-                echo "::error::Plan file missing or empty: $PLAN_FILE"
-                exit 1
+            echo "::notice::Downloading multiple items (continue on failures). PLAN_KIND=$PLAN_KIND MODE=$MODE"
+
+            while read -r target fmt; do
+              if [[ -z "$target" || -z "$fmt" ]]; then
+                continue
               fi
 
-              echo "::notice::Downloading multiple items (continue on failures). PLAN_KIND=$PLAN_KIND"
-
-              while read -r target fmt; do
-                if [[ -z "$target" || -z "$fmt" ]]; then
-                  continue
-                fi
-
-                if [[ "$PLAN_KIND" == "clips" ]]; then
-                  # target is a clip URL; use trailer=t0
-                  clip_url="$target"
-                  echo "::notice::Downloading clip URL with format=$fmt"
-                  set +e
-                  python manzana.py "${default_args[@]}" --no-prompt --trailer t0 -f "$fmt" "$clip_url"
-                  rc=$?
-                  set -e
-                  if [[ $rc -ne 0 ]]; then
-                    failures+=("$clip_url")
-                    echo "::warning::Download failed for clip (rc=$rc). Continuing..."
-                  else
-                    ((success_count+=1))
-                  fi
+              if [[ "$PLAN_KIND" == "clips" ]]; then
+                clip_url="$target"
+                echo "::notice::Downloading clip URL with format=$fmt"
+                set +e
+                python manzana.py "${default_args[@]}" --no-prompt --trailer t0 -f "$fmt" "$clip_url"
+                rc=$?
+                set -e
+                if [[ $rc -ne 0 ]]; then
+                  failures+=("$clip_url")
+                  echo "::warning::Download failed for clip (rc=$rc). Continuing..."
                 else
-                  # target is tid (t0/t1/...)
-                  tid="$target"
-                  echo "::notice::Downloading $tid with format=$fmt"
-                  set +e
-                  python manzana.py "${default_args[@]}" --no-prompt --trailer "$tid" -f "$fmt" "$URL"
-                  rc=$?
-                  set -e
-                  if [[ $rc -ne 0 ]]; then
-                    failures+=("$tid")
-                    echo "::warning::Download failed for $tid (rc=$rc). Continuing..."
-                  else
-                    ((success_count+=1))
-                  fi
+                  ((success_count+=1))
                 fi
-              done < "$PLAN_FILE"
+              else
+                tid="$target"
+                echo "::notice::Downloading $tid with format=$fmt"
+                set +e
+                python manzana.py "${default_args[@]}" --no-prompt --trailer "$tid" -f "$fmt" "$URL"
+                rc=$?
+                set -e
+                if [[ $rc -ne 0 ]]; then
+                  failures+=("$tid")
+                  echo "::warning::Download failed for $tid (rc=$rc). Continuing..."
+                else
+                  ((success_count+=1))
+                fi
+              fi
+            done < "$PLAN_FILE"
 
-            else
-              echo "::notice::Downloading single trailer $TRAILER with format=$EFF"
-              python manzana.py "${default_args[@]}" --no-prompt --trailer "$TRAILER" -f "$EFF" "$URL"
-              success_count=1
-            fi
+          else
+            # Single item behavior (custom single OR preset single)
+            echo "::notice::Downloading single trailer $TRAILER with format=$EFF"
+            python manzana.py "${default_args[@]}" --no-prompt --trailer "$TRAILER" -f "$EFF" "$URL"
+            success_count=1
           fi
 
           if [[ $success_count -le 0 ]]; then
