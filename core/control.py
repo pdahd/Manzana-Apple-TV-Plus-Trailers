@@ -5,6 +5,7 @@ from rich.console import Console
 from rich import box
 from rich.table import Table
 from rich.columns import Columns
+from urllib.parse import urlparse
 
 from core.api import AppleTVPlus
 from core.api import get_hls
@@ -22,26 +23,35 @@ from core.tagger import tagFile
 
 from utils import logger, sanitize
 
+# core/control.py @ v2.3.1
+# Changes:
+# - Fix output filename collisions when downloading multiple trailers:
+#     Add a trailer tag suffix: [t0] / [t1] / ...
+#   This prevents "already exists! Skipping..." from skipping different trailers
+#   that share the same title/videoTitle/releaseDate.
+# - For clip URLs (/.../clip/.../umc.cmc.X), also add a clip id suffix to avoid
+#   collisions when many clips share the same videoTitle.
+
+
 cons = Console()
 
+
 def __get_path():
-    if getattr(sys, 'frozen', False):
+    if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     else:
-        return os.path.dirname(
-            os.path.dirname(
-                os.path.abspath(__file__)
-            )
-        )
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-TEMPDIR = os.path.join(__get_path(), 'temp')
-OUTPUTDIR = os.path.join(__get_path(), 'output')
+
+TEMPDIR = os.path.join(__get_path(), "temp")
+OUTPUTDIR = os.path.join(__get_path(), "output")
 
 if not os.path.exists(TEMPDIR):
     os.makedirs(TEMPDIR)
 
 if not os.path.exists(OUTPUTDIR):
     os.makedirs(OUTPUTDIR)
+
 
 def _print_trailers(trailers: list):
     table = Table(box=box.ROUNDED)
@@ -55,6 +65,7 @@ def _print_trailers(trailers: list):
     print()
     cons.print(Columns(["       ", table]))
     print()
+
 
 def _select_trailers(trailers: list, trailer_arg: str, no_prompt: bool):
     # trailer_arg:
@@ -82,15 +93,54 @@ def _select_trailers(trailers: list, trailer_arg: str, no_prompt: bool):
 
     return [trailers[idx]]
 
+
+def _normalize_trailer_tag(trailer_arg: str, fallback: str) -> str:
+    """
+    Return a stable tag like "t0" / "t1" for filenames.
+    - If trailer_arg is None/empty or 'all' -> fallback
+    - Accept 'tN' or 'N'
+    """
+    if not trailer_arg:
+        return fallback
+    ta = trailer_arg.strip().lower()
+    if ta in ("all", "a"):
+        return fallback
+    if ta.startswith("t"):
+        ta = ta[1:]
+    if ta.isdigit():
+        return f"t{int(ta)}"
+    return fallback
+
+
+def _clip_id_suffix_from_url(page_url: str):
+    """
+    If url is like https://tv.apple.com/<sf>/clip/<slug>/umc.cmc.<clipId>
+    return a short suffix string for filename uniqueness, else None.
+    """
+    try:
+        u = urlparse(page_url)
+        parts = [p for p in u.path.split("/") if p]
+        # parts: [storefront, kind, slug, id]
+        if len(parts) >= 4 and parts[1] == "clip":
+            last = parts[-1]
+            if last.startswith("umc.cmc."):
+                return last.split("umc.cmc.", 1)[1]
+            return last
+    except Exception:
+        pass
+    return None
+
+
 def _video_sort_key(t: dict):
     res = t.get("resolution") or (0, 0)
     try:
         w, h = res
         area = int(w) * int(h)
-    except:
+    except Exception:
         area = 0
     bw = t.get("bandwidth") or 0
     return (area, int(bw))
+
 
 def _audio_sort_key(t: dict):
     # original first, AD last
@@ -98,15 +148,17 @@ def _audio_sort_key(t: dict):
         0 if t.get("isOriginal") else 1,
         1 if t.get("isAD") else 0,
         (t.get("language") or ""),
-        (t.get("channels") or "")
+        (t.get("channels") or ""),
     )
+
 
 def _sub_sort_key(t: dict):
     return (
         (t.get("language") or ""),
         1 if t.get("isForced") else 0,
-        1 if t.get("isSDH") else 0
+        1 if t.get("isSDH") else 0,
     )
+
 
 def _with_ids(items: list, prefix: str, sort_key=None, reverse=False):
     items2 = list(items)
@@ -120,11 +172,13 @@ def _with_ids(items: list, prefix: str, sort_key=None, reverse=False):
         out.append(it2)
     return out
 
+
 def _index_tracks(hls: dict):
     vids = _with_ids(hls.get("video", []), "v", sort_key=_video_sort_key, reverse=True)
     auds = _with_ids(hls.get("audio", []), "a", sort_key=_audio_sort_key, reverse=False)
     subs = _with_ids(hls.get("subtitle", []), "s", sort_key=_sub_sort_key, reverse=False)
     return {"video": vids, "audio": auds, "subtitle": subs}
+
 
 def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: str, trailer_hint: str):
     print()
@@ -153,7 +207,7 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
             str(v.get("bitrate")),
             res_str,
             str(v.get("fps")),
-            str(v.get("range"))
+            str(v.get("range")),
         )
 
     # Audio
@@ -174,7 +228,7 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
             str(a.get("channels")),
             str(a.get("language")),
             "YES" if a.get("isOriginal") else "NO",
-            "YES" if a.get("isAD") else "NO"
+            "YES" if a.get("isAD") else "NO",
         )
 
     # Subs
@@ -191,7 +245,7 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
             str(s.get("language")),
             "YES" if s.get("isForced") else "NO",
             "YES" if s.get("isSDH") else "NO",
-            str(s.get("name"))
+            str(s.get("name")),
         )
 
     cons.print(Columns(["       ", vtable]))
@@ -202,10 +256,9 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
     print()
 
     cons.print("[bold]Example download command:[/]")
-    cons.print(
-        f'  python manzana.py --no-prompt --trailer {trailer_hint} -f "v0+a0" "{page_url}"'
-    )
+    cons.print(f'  python manzana.py --no-prompt --trailer {trailer_hint} -f "v0+a0" "{page_url}"')
     print()
+
 
 def _parse_format_expr(expr: str):
     # supports "v0+a1+s2" and multiple audios/subs
@@ -233,6 +286,7 @@ def _parse_format_expr(expr: str):
 
     return v[0], a, s
 
+
 def _select_by_format(expr: str, indexed: dict):
     v_id, a_ids, s_ids = _parse_format_expr(expr)
 
@@ -257,6 +311,7 @@ def _select_by_format(expr: str, indexed: dict):
 
     return selected
 
+
 def _ensure_tools(selected_tracks: list):
     # MP4Box is required for muxing output.mp4
     if not shutil.which("MP4Box"):
@@ -266,6 +321,7 @@ def _ensure_tools(selected_tracks: list):
     need_ffmpeg = any(t.get("type") == "subtitle" for t in selected_tracks)
     if need_ffmpeg and (not shutil.which("ffmpeg")):
         logger.error('Unable to find "ffmpeg" in PATH! (required for subtitle conversion)', 1)
+
 
 def run(args):
     try:
@@ -279,8 +335,13 @@ def run(args):
 
         selected_trailers = _select_trailers(trailers, args.trailer, args.noPrompt)
 
+        # For clip URLs, append a clip id suffix to filename (avoids collisions across multiple clips)
+        clip_suffix = _clip_id_suffix_from_url(args.url)
+
         for ti, item in enumerate(selected_trailers):
-            trailer_hint = args.trailer if args.trailer else f"t{ti}"
+            trailer_tag = _normalize_trailer_tag(args.trailer, fallback=f"t{ti}")
+            trailer_hint = trailer_tag  # for example command output
+
             master_url = item["hlsUrl"]
 
             # list formats mode
@@ -292,17 +353,22 @@ def run(args):
                 continue
 
             # download mode (need output path)
-            op = os.path.join(
-                OUTPUTDIR,
-                '{} - {} ({}) Trailer [WEB-DL] [ATVP].mp4'.format(
-                    sanitize(item['title']),
-                    sanitize(item['videoTitle']),
-                    item['releaseDate'][0:4]
-                )
+            year = str(item.get("releaseDate") or "")[0:4] or "0000"
+
+            base_name = "{} - {} ({}) Trailer [WEB-DL] [ATVP] [{}]".format(
+                sanitize(item.get("title") or ""),
+                sanitize(item.get("videoTitle") or ""),
+                year,
+                trailer_tag,
             )
 
+            if clip_suffix:
+                base_name += f" [clip-{sanitize(clip_suffix)}]"
+
+            op = os.path.join(OUTPUTDIR, base_name + ".mp4")
+
             if os.path.exists(op):
-                logger.info(f'"{item["videoTitle"]}" is already exists! Skipping...')
+                logger.info(f'"{os.path.basename(op)}" is already exists! Skipping...')
                 print("-" * 30)
                 continue
 
@@ -341,7 +407,7 @@ def run(args):
 
             try:
                 parse_uri(userReq)
-            except:
+            except Exception:
                 parse_uri(userReq, ssl=False)
 
             logger.info("Downloading segments...")
@@ -351,7 +417,7 @@ def run(args):
             print()
             try:
                 download(userReq)
-            except:
+            except Exception:
                 download(userReq, ssl=False)
             print()
 
@@ -359,7 +425,7 @@ def run(args):
             appendFiles(userReq)
 
             logger.info("Saving output...")
-            shutil.move(os.path.join(TEMPDIR, 'output.mp4'), op)
+            shutil.move(os.path.join(TEMPDIR, "output.mp4"), op)
 
             logger.info("Tagging...")
             tagFile(item, op)
