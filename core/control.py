@@ -23,14 +23,14 @@ from core.tagger import tagFile
 
 from utils import logger, sanitize
 
-# core/control.py @ v2.3.1
-# Changes:
-# - Fix output filename collisions when downloading multiple trailers:
-#     Add a trailer tag suffix: [t0] / [t1] / ...
-#   This prevents "already exists! Skipping..." from skipping different trailers
-#   that share the same title/videoTitle/releaseDate.
-# - For clip URLs (/.../clip/.../umc.cmc.X), also add a clip id suffix to avoid
-#   collisions when many clips share the same videoTitle.
+# core/control.py @ v2.3.2
+# Changes vs v2.3.1:
+# - Add explicit human-readable logs for each item (trailer/clip) before downloading:
+#     * trailer tag (t0/t1/..)
+#     * title / videoTitle (so Actions logs show "吹替版/字幕版")
+#     * output filename
+# - Keep v2.3.1 output filename collision fixes:
+#     Add [tN] suffix; for clip URLs also add [clip-<id>] suffix.
 
 
 cons = Console()
@@ -68,10 +68,6 @@ def _print_trailers(trailers: list):
 
 
 def _select_trailers(trailers: list, trailer_arg: str, no_prompt: bool):
-    # trailer_arg:
-    #   None => prompt in TTY (legacy), or error in no-prompt
-    #   "all"/"a" => all
-    #   "t0"/"t1" or "0"/"1" => single
     if trailer_arg is None:
         if (not no_prompt) and sys.stdin.isatty():
             return get_select(trailers)
@@ -95,11 +91,6 @@ def _select_trailers(trailers: list, trailer_arg: str, no_prompt: bool):
 
 
 def _normalize_trailer_tag(trailer_arg: str, fallback: str) -> str:
-    """
-    Return a stable tag like "t0" / "t1" for filenames.
-    - If trailer_arg is None/empty or 'all' -> fallback
-    - Accept 'tN' or 'N'
-    """
     if not trailer_arg:
         return fallback
     ta = trailer_arg.strip().lower()
@@ -113,10 +104,6 @@ def _normalize_trailer_tag(trailer_arg: str, fallback: str) -> str:
 
 
 def _clip_id_suffix_from_url(page_url: str):
-    """
-    If url is like https://tv.apple.com/<sf>/clip/<slug>/umc.cmc.<clipId>
-    return a short suffix string for filename uniqueness, else None.
-    """
     try:
         u = urlparse(page_url)
         parts = [p for p in u.path.split("/") if p]
@@ -143,7 +130,6 @@ def _video_sort_key(t: dict):
 
 
 def _audio_sort_key(t: dict):
-    # original first, AD last
     return (
         0 if t.get("isOriginal") else 1,
         1 if t.get("isAD") else 0,
@@ -186,7 +172,6 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
     cons.print(f"\tMaster M3U8: [bold]{master_url}[/]")
     print()
 
-    # Video
     vtable = Table(box=box.ROUNDED)
     vtable.add_column("ID", justify="center")
     vtable.add_column("Codec", justify="left")
@@ -197,10 +182,7 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
 
     for v in indexed["video"]:
         res = v.get("resolution")
-        if res:
-            res_str = f"{res[0]}x{res[1]}"
-        else:
-            res_str = "Null"
+        res_str = f"{res[0]}x{res[1]}" if res else "Null"
         vtable.add_row(
             v["fid"],
             str(v.get("codec")),
@@ -210,7 +192,6 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
             str(v.get("range")),
         )
 
-    # Audio
     atable = Table(box=box.ROUNDED)
     atable.add_column("ID", justify="center")
     atable.add_column("Codec", justify="left")
@@ -231,7 +212,6 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
             "YES" if a.get("isAD") else "NO",
         )
 
-    # Subs
     stable = Table(box=box.ROUNDED)
     stable.add_column("ID", justify="center")
     stable.add_column("Language", justify="center")
@@ -261,7 +241,6 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
 
 
 def _parse_format_expr(expr: str):
-    # supports "v0+a1+s2" and multiple audios/subs
     tokens = [t.strip() for t in expr.split("+") if t.strip()]
     v = []
     a = []
@@ -313,11 +292,9 @@ def _select_by_format(expr: str, indexed: dict):
 
 
 def _ensure_tools(selected_tracks: list):
-    # MP4Box is required for muxing output.mp4
     if not shutil.which("MP4Box"):
         logger.error('Unable to find "MP4Box" in PATH! (required for muxing)', 1)
 
-    # ffmpeg is only required if we selected subtitles (used to convert to srt)
     need_ffmpeg = any(t.get("type") == "subtitle" for t in selected_tracks)
     if need_ffmpeg and (not shutil.which("ffmpeg")):
         logger.error('Unable to find "ffmpeg" in PATH! (required for subtitle conversion)', 1)
@@ -340,19 +317,19 @@ def run(args):
 
         for ti, item in enumerate(selected_trailers):
             trailer_tag = _normalize_trailer_tag(args.trailer, fallback=f"t{ti}")
-            trailer_hint = trailer_tag  # for example command output
+            trailer_hint = trailer_tag
 
             master_url = item["hlsUrl"]
 
             # list formats mode
             if args.listFormats:
+                logger.info(f'Listing formats for [{trailer_tag}] {item.get("title","")} | {item.get("videoTitle","")}')
                 hls = get_hls(master_url)
                 indexed = _index_tracks(hls)
                 _print_formats(item, master_url, indexed, args.url, trailer_hint)
                 print("-" * 30)
                 continue
 
-            # download mode (need output path)
             year = str(item.get("releaseDate") or "")[0:4] or "0000"
 
             base_name = "{} - {} ({}) Trailer [WEB-DL] [ATVP] [{}]".format(
@@ -367,6 +344,10 @@ def run(args):
 
             op = os.path.join(OUTPUTDIR, base_name + ".mp4")
 
+            # NEW (v2.3.2): explicit human-readable logs
+            logger.info(f'Preparing [{trailer_tag}] {item.get("title","")} | {item.get("videoTitle","")}')
+            logger.info(f"Output file: {os.path.basename(op)}")
+
             if os.path.exists(op):
                 logger.info(f'"{os.path.basename(op)}" is already exists! Skipping...')
                 print("-" * 30)
@@ -375,14 +356,11 @@ def run(args):
             hls = get_hls(master_url)
             indexed = _index_tracks(hls)
 
-            # If -f is provided => non-interactive selection
             if args.format:
-                # if user also set --no-audio/--no-subs, we treat -f as authoritative
                 if args.noAudio or args.noSubs:
                     logger.warning('"-f/--format" provided; ignoring --no-audio/--no-subs')
                 userReq = _select_by_format(args.format, indexed)
             else:
-                # Legacy interactive mode (only if allowed)
                 if args.noPrompt or (not sys.stdin.isatty()):
                     logger.error('Non-interactive mode: please use -F to list formats and -f to select.', 1)
 
@@ -390,7 +368,6 @@ def run(args):
                 cons.print(f'\tContent: [i bold purple]{item["videoTitle"]}[/]')
                 print()
 
-                # interactive selection uses original (non-id) lists
                 userVideo = user_video(hls["video"])
                 if not args.noAudio:
                     userAudio = user_audio(hls["audio"])
@@ -443,7 +420,6 @@ def run(args):
             try:
                 os.removedirs(TEMPDIR)
             except OSError:
-                # might not be empty (or already removed)
                 pass
 
         logger.info("Done.")
