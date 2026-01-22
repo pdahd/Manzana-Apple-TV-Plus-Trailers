@@ -1,0 +1,194 @@
+name: MP4Box Bundle Cache Test
+
+# .github/workflows/mp4box-bundle-cache-test.yml @ v0.1.0
+# Purpose:
+# - Build a portable-ish MP4Box (gpac) bundle on cache miss.
+# - On cache hit, skip apt install entirely (near 0 seconds).
+# - Run on a matrix of ubuntu-latest and ubuntu-22.04 to compare stability.
+#
+# Notes:
+# - This bundles MP4Box + its shared libs and runs via an LD_LIBRARY_PATH wrapper.
+# - Best stability is achieved by pinning runs-on to a specific Ubuntu version (often ubuntu-22.04).
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_rev:
+        description: "🔁 Bundle cache revision (bump to rebuild cache), e.g. 1/2/3"
+        required: true
+        default: "1"
+        type: string
+      upload_bundle:
+        description: "📦 Upload gpac-bundle as artifact (for inspection)"
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  test:
+    name: test-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-22.04
+
+    steps:
+      - name: Show system info (OS/glibc/runner)
+        run: |
+          set -euo pipefail
+          echo "=== uname ==="
+          uname -a || true
+          echo "=== /etc/os-release ==="
+          cat /etc/os-release || true
+          echo "=== glibc (ldd) ==="
+          ldd --version | head -n 2 || true
+          echo "=== runner image ==="
+          echo "ImageOS=$ImageOS"
+          echo "ImageVersion=$ImageVersion"
+          echo "RunnerOS=$RUNNER_OS"
+          echo "RunnerArch=$RUNNER_ARCH"
+          echo "=== PATH ==="
+          echo "$PATH"
+
+      - name: Cache MP4Box bundle
+        id: cache-gpac
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/gpac-bundle
+          key: gpac-bundle-${{ runner.os }}-${{ matrix.os }}-rev${{ inputs.bundle_rev }}
+
+      - name: Build gpac bundle on cache miss (apt + ldd bundle)
+        if: ${{ steps.cache-gpac.outputs.cache-hit != 'true' }}
+        run: |
+          set -euo pipefail
+
+          echo "::notice::Cache miss -> installing gpac via apt and building bundle..."
+
+          sudo apt-get update
+          sudo apt-get install -y gpac
+
+          MP4BOX_PATH="$(command -v MP4Box)"
+          echo "MP4Box path: $MP4BOX_PATH"
+          MP4Box -version || true
+
+          BUNDLE="$HOME/.local/gpac-bundle"
+          BIN="$BUNDLE/bin"
+          LIB="$BUNDLE/lib"
+          mkdir -p "$BIN" "$LIB"
+
+          # Copy the real binary
+          cp -av "$MP4BOX_PATH" "$BIN/MP4Box.bin"
+
+          # Helper: copy lib real file + create symlink for requested SONAME if needed
+          copy_lib() {
+            local p="$1"
+            if [[ -z "$p" ]]; then
+              return 0
+            fi
+            if [[ ! -e "$p" ]]; then
+              echo "::warning::lib not found on disk: $p"
+              return 1
+            fi
+            local base
+            base="$(basename "$p")"
+            local real
+            real="$(readlink -f "$p" || true)"
+            if [[ -z "$real" || ! -e "$real" ]]; then
+              real="$p"
+            fi
+            local real_base
+            real_base="$(basename "$real")"
+
+            # Copy real file
+            if [[ ! -e "$LIB/$real_base" ]]; then
+              cp -av "$real" "$LIB/"
+            fi
+
+            # Create symlink for base name if different
+            if [[ "$base" != "$real_base" ]]; then
+              ln -sf "$real_base" "$LIB/$base"
+            fi
+          }
+
+          # Collect shared libs from ldd (ignore linux-vdso and "not found")
+          echo "::group::ldd MP4Box.bin"
+          ldd "$BIN/MP4Box.bin" || true
+          echo "::endgroup::"
+
+          missing=0
+          while IFS= read -r line; do
+            # Examples:
+            #   libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x...)
+            #   /lib64/ld-linux-x86-64.so.2 (0x...)
+            #   linux-vdso.so.1 (0x...)
+            if echo "$line" | grep -q "not found"; then
+              echo "::error::Missing dependency: $line"
+              missing=1
+              continue
+            fi
+
+            # Extract absolute paths
+            p="$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) {print $i; exit}}')"
+            if [[ -z "$p" ]]; then
+              continue
+            fi
+
+            # Skip vdso
+            if echo "$p" | grep -q "linux-vdso"; then
+              continue
+            fi
+
+            # Copy it
+            if ! copy_lib "$p"; then
+              missing=1
+            fi
+          done < <(ldd "$BIN/MP4Box.bin" || true)
+
+          if [[ "$missing" -ne 0 ]]; then
+            echo "::error::Some dependencies were missing/unpackable."
+            exit 1
+          fi
+
+          # Wrapper: ensure LD_LIBRARY_PATH points to bundle libs
+          cat > "$BIN/MP4Box" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="$DIR/../lib:${LD_LIBRARY_PATH:-}"
+          exec "$DIR/MP4Box.bin" "$@"
+          SH
+          chmod +x "$BIN/MP4Box"
+
+          echo "::notice::Bundle built at $BUNDLE"
+          echo "::group::Bundle tree"
+          ls -la "$BIN"
+          ls -la "$LIB" | head -n 80 || true
+          echo "::endgroup::"
+
+      - name: Use MP4Box bundle (cache hit => no apt install)
+        run: |
+          set -euo pipefail
+          echo "$HOME/.local/gpac-bundle/bin" >> "$GITHUB_PATH"
+          command -v MP4Box
+          MP4Box -version || true
+
+      - name: Quick runtime check (ldd + run)
+        run: |
+          set -euo pipefail
+          MP4="$(command -v MP4Box)"
+          echo "MP4Box wrapper: $MP4"
+          echo "::group::ldd wrapper target"
+          ldd "$HOME/.local/gpac-bundle/bin/MP4Box.bin" || true
+          echo "::endgroup::"
+          MP4Box -version || true
+
+      - name: Upload gpac bundle artifact (optional)
+        if: ${{ inputs.upload_bundle }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpac-bundle-${{ matrix.os }}-rev${{ inputs.bundle_rev }}
+          path: ~/.local/gpac-bundle
+          if-no-files-found: error
