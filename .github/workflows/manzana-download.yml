@@ -1,10 +1,18 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.6.7
-# Changes vs v1.6.6:
-# - Inspect step: replace Python heredoc with sha1sum one-liner to compute safe report ids.
-#   This avoids GitHub editor YAML warnings and is simpler/robust.
-# - All other behaviors preserved (grouped logs, clip fallback, custom all expansion, Phase 1 dedup, resolve titles).
+# .github/workflows/manzana-download.yml @ v1.6.8
+# Changes vs v1.6.7:
+# - Support trailer=tN fallback to clip list when API trailer count <= N.
+#   This fixes pages where API returns only t0 but the page has multiple clip cards.
+#   Applied consistently to:
+#     * Phase 1 (-F list formats)
+#     * Compute EFFECTIVE_FORMAT / PLAN (preset/custom)
+#     * Phase 2 download (via single-item plan with PLAN_KIND=clips)
+# - Keep:
+#     * grouped logs
+#     * clip fallback for trailer=all when API count<=1
+#     * custom all expansion
+#     * safe report names + manifest.tsv
 
 on:
   workflow_dispatch:
@@ -15,13 +23,13 @@ on:
         type: string
 
       trailer:
-        description: 'Trailer selector: use t0, t1, t2... (e.g. "t0") or "all". In preset modes, "all" will apply presets to each trailer (or clip fallback when API list is incomplete). In custom mode, "all" will loop items with the same format.'
+        description: 'Trailer selector: use t0, t1, t2... (e.g. "t0") or "all". If a page only exposes t0 via API but has multiple clip cards, tN will fall back to the Nth clip.'
         required: false
         default: "t0"
         type: string
 
       default_only:
-        description: "Use --default (only default trailer metadata). If enabled, the page usually has a single default video (trailer=all behaves like t0)."
+        description: "Use --default (only default trailer metadata). If enabled, the page usually has a single default video."
         required: false
         default: false
         type: boolean
@@ -57,7 +65,7 @@ on:
           - 4K_HDR
 
       audio_quality:
-        description: "Audio quality (ONLY used when mode=preset_video). Fallback: if Atmos/DD5.1 not available -> AAC. Use 'none' for a true video-only output."
+        description: "Audio quality (ONLY used when mode=preset_video)."
         required: true
         type: choice
         default: AAC
@@ -68,7 +76,7 @@ on:
           - DD5.1
 
       audio_lang:
-        description: 'Audio language (preset modes only). "original" = original-content track. If selected language not available -> fallback to best original AAC.'
+        description: 'Audio language (preset modes only). "original" = original-content track.'
         required: true
         type: choice
         default: original
@@ -89,7 +97,7 @@ on:
           - ru
 
       sub_lang:
-        description: 'Subtitle language (preset modes only). Default "none". If subtitles missing or language not found -> no subtitles (no error).'
+        description: 'Subtitle language (preset modes only). Default "none".'
         required: true
         type: choice
         default: none
@@ -110,7 +118,7 @@ on:
           - ru
 
       format:
-        description: 'CUSTOM mode only. Leave EMPTY on first run to ONLY LIST formats (Phase 1) and upload formats.txt (NO DOWNLOAD). Then rerun and set format. Must include EXACTLY ONE vN.'
+        description: 'CUSTOM mode only. Leave EMPTY on first run to ONLY LIST formats (Phase 1). Then rerun and set format.'
         required: false
         default: ""
         type: string
@@ -225,14 +233,58 @@ jobs:
             exit 0
           fi
 
+          # --- trailer=tN single listing (with out-of-range fallback to clip N) ---
           if ! [[ "$TRAILER" =~ ^(all|a)$ ]]; then
-            echo "========== TRAILER $TRAILER ==========" | tee -a formats.txt
-            echo "::group::Formats ($TRAILER)"
-            python manzana.py --no-prompt --trailer "$TRAILER" -F "$URL" | tee -a formats.txt
+            # Parse N
+            idx="${TRAILER#t}"
+            if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
+              echo "::error::Unexpected trailer format: $TRAILER"
+              exit 1
+            fi
+
+            COUNT="$(python tools/list_trailers.py --url "$URL" $DEFAULT_FLAG | tail -n 1 | tr -d '\r\n')"
+            if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
+              echo "::warning::Unable to parse trailer count; trying direct t${idx}..."
+              echo "========== TRAILER $TRAILER ==========" | tee -a formats.txt
+              echo "::group::Formats ($TRAILER)"
+              python manzana.py --no-prompt --trailer "$TRAILER" -F "$URL" | tee -a formats.txt
+              echo "::endgroup::"
+              exit 0
+            fi
+
+            if (( idx < COUNT )); then
+              echo "========== TRAILER $TRAILER ==========" | tee -a formats.txt
+              echo "::group::Formats ($TRAILER)"
+              python manzana.py --no-prompt --trailer "$TRAILER" -F "$URL" | tee -a formats.txt
+              echo "::endgroup::"
+              exit 0
+            fi
+
+            echo "::notice::Phase 1: API provides only $COUNT trailer(s). Requested $TRAILER is out of range; falling back to clip index $idx." | tee -a formats.txt
+            mapfile -t CLIPS_RAW < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG --resolve-titles)
+
+            if [[ ${#CLIPS_RAW[@]} -le 0 ]]; then
+              echo "::error::No clip URLs found for fallback. Cannot satisfy $TRAILER." | tee -a formats.txt
+              exit 1
+            fi
+
+            if (( idx >= ${#CLIPS_RAW[@]} )); then
+              echo "::error::Requested $TRAILER but clip list has only ${#CLIPS_RAW[@]} item(s)." | tee -a formats.txt
+              exit 1
+            fi
+
+            clip_url="${CLIPS_RAW[$idx]}"
+            clip_id="$(echo "$clip_url" | sed -n 's|.*/umc\.cmc\.\([^?&/]*\).*|\1|p')"
+            [[ -z "$clip_id" ]] && clip_id="unknown"
+
+            echo "========== CLIP (fallback for $TRAILER): $clip_url ==========" | tee -a formats.txt
+            echo "::group::Formats (clip-$clip_id for $TRAILER)"
+            python manzana.py --no-prompt --trailer t0 -F "$clip_url" | tee -a formats.txt
             echo "::endgroup::"
             exit 0
           fi
 
+          # --- trailer=all path ---
           COUNT="$(python tools/list_trailers.py --url "$URL" $DEFAULT_FLAG | tail -n 1 | tr -d '\r\n')"
           if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
             echo "::warning::Unable to parse trailer count for Phase 1; falling back to listing t0 only."
@@ -256,7 +308,6 @@ jobs:
           fi
 
           echo "========== ALL (clip fallback) ==========" | tee -a formats.txt
-
           mapfile -t CLIPS_RAW < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG --resolve-titles)
 
           if [[ ${#CLIPS_RAW[@]} -le 0 ]]; then
@@ -272,9 +323,7 @@ jobs:
           CLIPS=()
           for c in "${CLIPS_RAW[@]}"; do
             c="$(printf "%s" "$c" | tr -d '\r\n')"
-            if [[ -z "$c" ]]; then
-              continue
-            fi
+            [[ -z "$c" ]] && continue
             if [[ -n "${seen[$c]+x}" ]]; then
               continue
             fi
@@ -289,9 +338,7 @@ jobs:
             echo "========== CLIP: $clip_url ==========" | tee -a formats.txt
 
             clip_id="$(echo "$clip_url" | sed -n 's|.*/umc\.cmc\.\([^?&/]*\).*|\1|p')"
-            if [[ -z "$clip_id" ]]; then
-              clip_id="unknown"
-            fi
+            [[ -z "$clip_id" ]] && clip_id="unknown"
 
             echo "::group::Formats (clip-$clip_id)"
             python manzana.py --no-prompt --trailer t0 -F "$clip_url" | tee -a formats.txt
@@ -322,6 +369,48 @@ jobs:
           PLAN_FILE="$RUNNER_TEMP/manzana_plan.txt"
           : > "$PLAN_FILE"
           echo "FORMAT_PLAN_FILE=$PLAN_FILE" >> "$GITHUB_ENV"
+
+          # Helper: map trailer=tN to either movie tN or clip N (returns kind + value)
+          # Writes: MAP_KIND=(trailers|clips), MAP_TARGET=(tN or clip_url)
+          map_trailer_single() {
+            local url="$1"
+            local trailer="$2"
+
+            local idx="${trailer#t}"
+            if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
+              echo "::error::Unexpected trailer format: $trailer"
+              exit 1
+            fi
+
+            local count
+            count="$(python tools/list_trailers.py --url "$url" $DEFAULT_FLAG | tail -n 1 | tr -d '\r\n')"
+            if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+              echo "MAP_KIND=trailers"
+              echo "MAP_TARGET=$trailer"
+              return 0
+            fi
+
+            if (( idx < count )); then
+              echo "MAP_KIND=trailers"
+              echo "MAP_TARGET=$trailer"
+              return 0
+            fi
+
+            echo "::notice::Requested $trailer but API count=$count. Falling back to clip index $idx."
+            mapfile -t clips < <(python tools/list_clip_urls.py --url "$url" $DEFAULT_FLAG --resolve-titles)
+            if [[ ${#clips[@]} -le 0 ]]; then
+              echo "::error::Clip fallback found 0 clip URLs; cannot satisfy $trailer."
+              exit 1
+            fi
+            if (( idx >= ${#clips[@]} )); then
+              echo "::error::Requested $trailer but clip list has only ${#clips[@]} item(s)."
+              exit 1
+            fi
+
+            echo "MAP_KIND=clips"
+            echo "MAP_TARGET=${clips[$idx]}"
+            return 0
+          }
 
           if [[ "$MODE" == "custom" ]]; then
             F="${{ inputs.format }}"
@@ -383,6 +472,17 @@ jobs:
               exit 0
             fi
 
+            # custom single (tN may fallback to clip N)
+            eval "$(map_trailer_single "$URL" "$TRAILER")"
+            if [[ "$MAP_KIND" == "clips" ]]; then
+              echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
+              echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
+              echo "$MAP_TARGET $F" >> "$PLAN_FILE"
+              echo "::notice::Computed plan (single clip via $TRAILER -> format):"
+              cat "$PLAN_FILE"
+              exit 0
+            fi
+
             echo "EFFECTIVE_FORMAT=$F" >> "$GITHUB_ENV"
             echo "DOWNLOAD_ALL=false" >> "$GITHUB_ENV"
             echo "PLAN_KIND=single" >> "$GITHUB_ENV"
@@ -439,81 +539,114 @@ jobs:
                 if [[ ${#sel_failed[@]} -gt 0 ]]; then
                   echo "::warning::Selector failed for trailers: ${sel_failed[*]}"
                 fi
-              else
-                echo "::notice::API trailer count=$COUNT (<=1). Falling back to clip URLs from HTML..."
-                echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
-                echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
-
-                mapfile -t CLIPS < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG --resolve-titles)
-                if [[ ${#CLIPS[@]} -le 0 ]]; then
-                  echo "::error::Clip fallback found 0 clip URLs. Unable to continue."
-                  exit 1
-                fi
-
-                echo "::notice::Clip fallback: found ${#CLIPS[@]} clip URLs."
-                sel_failed=()
-
-                for clip_url in "${CLIPS[@]}"; do
-                  clip_url="$(printf "%s" "$clip_url" | tr -d '\r\n')"
-                  [[ -z "$clip_url" ]] && continue
-
-                  set +e
-                  if [[ "$MODE" == "preset_av" ]]; then
-                    EFF="$(python tools/select_format.py --url "$clip_url" --trailer t0 $DEFAULT_FLAG --mode preset_av \
-                      --preset-av-profile "${{ inputs.preset_av_profile }}" --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
-                      | tail -n 1 | tr -d '\r\n')"
-                  else
-                    EFF="$(python tools/select_format.py --url "$clip_url" --trailer t0 $DEFAULT_FLAG --mode preset_video \
-                      --preset-video-profile "${{ inputs.preset_video_profile }}" --audio-quality "${{ inputs.audio_quality }}" \
-                      --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
-                      | tail -n 1 | tr -d '\r\n')"
-                  fi
-                  RC=$?
-                  set -e
-
-                  if [[ $RC -ne 0 || -z "$EFF" ]]; then
-                    sel_failed+=("$clip_url")
-                    echo "::warning::Selector failed for clip URL (skipping): $clip_url"
-                    continue
-                  fi
-
-                  echo "$clip_url $EFF" >> "$PLAN_FILE"
-                done
-
-                if [[ ! -s "$PLAN_FILE" ]]; then
-                  echo "::error::All clip URLs failed during selection (no plan entries)."
-                  exit 1
-                fi
-
-                echo "::notice::Computed plan (clip_url -> format):"
-                cat "$PLAN_FILE"
-                if [[ ${#sel_failed[@]} -gt 0 ]]; then
-                  echo "::warning::Selector failed for some clip URLs (${#sel_failed[@]})."
-                fi
+                exit 0
               fi
-            else
-              echo "DOWNLOAD_ALL=false" >> "$GITHUB_ENV"
-              echo "PLAN_KIND=single" >> "$GITHUB_ENV"
 
+              echo "::notice::API trailer count=$COUNT (<=1). Falling back to clip URLs from HTML..."
+              echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
+              echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
+
+              mapfile -t CLIPS < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG --resolve-titles)
+              if [[ ${#CLIPS[@]} -le 0 ]]; then
+                echo "::error::Clip fallback found 0 clip URLs. Unable to continue."
+                exit 1
+              fi
+
+              echo "::notice::Clip fallback: found ${#CLIPS[@]} clip URLs."
+              sel_failed=()
+
+              for clip_url in "${CLIPS[@]}"; do
+                clip_url="$(printf "%s" "$clip_url" | tr -d '\r\n')"
+                [[ -z "$clip_url" ]] && continue
+
+                set +e
+                if [[ "$MODE" == "preset_av" ]]; then
+                  EFF="$(python tools/select_format.py --url "$clip_url" --trailer t0 $DEFAULT_FLAG --mode preset_av \
+                    --preset-av-profile "${{ inputs.preset_av_profile }}" --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
+                    | tail -n 1 | tr -d '\r\n')"
+                else
+                  EFF="$(python tools/select_format.py --url "$clip_url" --trailer t0 $DEFAULT_FLAG --mode preset_video \
+                    --preset-video-profile "${{ inputs.preset_video_profile }}" --audio-quality "${{ inputs.audio_quality }}" \
+                    --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
+                    | tail -n 1 | tr -d '\r\n')"
+                fi
+                RC=$?
+                set -e
+
+                if [[ $RC -ne 0 || -z "$EFF" ]]; then
+                  sel_failed+=("$clip_url")
+                  echo "::warning::Selector failed for clip URL (skipping): $clip_url"
+                  continue
+                fi
+
+                echo "$clip_url $EFF" >> "$PLAN_FILE"
+              done
+
+              if [[ ! -s "$PLAN_FILE" ]]; then
+                echo "::error::All clip URLs failed during selection (no plan entries)."
+                exit 1
+              fi
+
+              echo "::notice::Computed plan (clip_url -> format):"
+              cat "$PLAN_FILE"
+              if [[ ${#sel_failed[@]} -gt 0 ]]; then
+                echo "::warning::Selector failed for some clip URLs (${#sel_failed[@]})."
+              fi
+              exit 0
+            fi
+
+            # preset single (tN may fallback to clip N)
+            eval "$(map_trailer_single "$URL" "$TRAILER")"
+            if [[ "$MAP_KIND" == "clips" ]]; then
+              echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
+              echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
+
+              set +e
               if [[ "$MODE" == "preset_av" ]]; then
-                EFF="$(python tools/select_format.py --url "$URL" --trailer "$TRAILER" $DEFAULT_FLAG --mode preset_av \
+                EFF="$(python tools/select_format.py --url "$MAP_TARGET" --trailer t0 $DEFAULT_FLAG --mode preset_av \
                   --preset-av-profile "${{ inputs.preset_av_profile }}" --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
                   | tail -n 1 | tr -d '\r\n')"
               else
-                EFF="$(python tools/select_format.py --url "$URL" --trailer "$TRAILER" $DEFAULT_FLAG --mode preset_video \
+                EFF="$(python tools/select_format.py --url "$MAP_TARGET" --trailer t0 $DEFAULT_FLAG --mode preset_video \
                   --preset-video-profile "${{ inputs.preset_video_profile }}" --audio-quality "${{ inputs.audio_quality }}" \
                   --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
                   | tail -n 1 | tr -d '\r\n')"
               fi
-
-              if [[ -z "$EFF" ]]; then
-                echo "::error::Selector returned empty effective format."
+              RC=$?
+              set -e
+              if [[ $RC -ne 0 || -z "$EFF" ]]; then
+                echo "::error::Selector failed for fallback clip ($TRAILER -> $MAP_TARGET)"
                 exit 1
               fi
 
-              echo "EFFECTIVE_FORMAT=$EFF" >> "$GITHUB_ENV"
-              echo "::notice::preset mode -> computed format: $EFF"
+              echo "$MAP_TARGET $EFF" >> "$PLAN_FILE"
+              echo "::notice::Computed plan (single clip via $TRAILER -> format):"
+              cat "$PLAN_FILE"
+              exit 0
             fi
+
+            # normal single trailer on movie URL
+            echo "DOWNLOAD_ALL=false" >> "$GITHUB_ENV"
+            echo "PLAN_KIND=single" >> "$GITHUB_ENV"
+
+            if [[ "$MODE" == "preset_av" ]]; then
+              EFF="$(python tools/select_format.py --url "$URL" --trailer "$TRAILER" $DEFAULT_FLAG --mode preset_av \
+                --preset-av-profile "${{ inputs.preset_av_profile }}" --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
+                | tail -n 1 | tr -d '\r\n')"
+            else
+              EFF="$(python tools/select_format.py --url "$URL" --trailer "$TRAILER" $DEFAULT_FLAG --mode preset_video \
+                --preset-video-profile "${{ inputs.preset_video_profile }}" --audio-quality "${{ inputs.audio_quality }}" \
+                --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
+                | tail -n 1 | tr -d '\r\n')"
+            fi
+
+            if [[ -z "$EFF" ]]; then
+              echo "::error::Selector returned empty effective format."
+              exit 1
+            fi
+
+            echo "EFFECTIVE_FORMAT=$EFF" >> "$GITHUB_ENV"
+            echo "::notice::preset mode -> computed format: $EFF"
             exit 0
           fi
 
@@ -668,7 +801,6 @@ jobs:
             base="$(basename "$f")"
             echo "=== Inspecting: $base ==="
 
-            # Safe id (12 hex chars) derived from filename. Works across all filesystems for upload-artifact.
             sid="$(printf '%s' "$base" | sha1sum | awk '{print substr($1,1,12)}')"
             printf '%s\t%s\n' "$sid" "$base" >> report/manifest.tsv
 
