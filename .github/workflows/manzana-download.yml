@@ -1,18 +1,11 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.6.8
-# Changes vs v1.6.7:
-# - Support trailer=tN fallback to clip list when API trailer count <= N.
-#   This fixes pages where API returns only t0 but the page has multiple clip cards.
-#   Applied consistently to:
-#     * Phase 1 (-F list formats)
-#     * Compute EFFECTIVE_FORMAT / PLAN (preset/custom)
-#     * Phase 2 download (via single-item plan with PLAN_KIND=clips)
-# - Keep:
-#     * grouped logs
-#     * clip fallback for trailer=all when API count<=1
-#     * custom all expansion
-#     * safe report names + manifest.tsv
+# .github/workflows/manzana-download.yml @ v1.6.9
+# Changes vs v1.6.8:
+# - Fix "line XXX: ::notice::Requested: command not found" when Trailer=tN triggers clip fallback.
+#   Root cause: using eval "$(map_trailer_single ...)" while the function also printed ::notice:: lines.
+#   Fix: remove eval entirely; map_trailer_single now sets global variables MAP_KIND/MAP_TARGET directly.
+# - Everything else preserved: Phase 1 grouped/dedup, custom/all expansion, clip fallback, safe report names.
 
 on:
   workflow_dispatch:
@@ -233,9 +226,7 @@ jobs:
             exit 0
           fi
 
-          # --- trailer=tN single listing (with out-of-range fallback to clip N) ---
           if ! [[ "$TRAILER" =~ ^(all|a)$ ]]; then
-            # Parse N
             idx="${TRAILER#t}"
             if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
               echo "::error::Unexpected trailer format: $TRAILER"
@@ -244,7 +235,7 @@ jobs:
 
             COUNT="$(python tools/list_trailers.py --url "$URL" $DEFAULT_FLAG | tail -n 1 | tr -d '\r\n')"
             if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
-              echo "::warning::Unable to parse trailer count; trying direct t${idx}..."
+              echo "::warning::Unable to parse trailer count; trying direct $TRAILER..."
               echo "========== TRAILER $TRAILER ==========" | tee -a formats.txt
               echo "::group::Formats ($TRAILER)"
               python manzana.py --no-prompt --trailer "$TRAILER" -F "$URL" | tee -a formats.txt
@@ -284,7 +275,6 @@ jobs:
             exit 0
           fi
 
-          # --- trailer=all path ---
           COUNT="$(python tools/list_trailers.py --url "$URL" $DEFAULT_FLAG | tail -n 1 | tr -d '\r\n')"
           if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
             echo "::warning::Unable to parse trailer count for Phase 1; falling back to listing t0 only."
@@ -370,8 +360,10 @@ jobs:
           : > "$PLAN_FILE"
           echo "FORMAT_PLAN_FILE=$PLAN_FILE" >> "$GITHUB_ENV"
 
-          # Helper: map trailer=tN to either movie tN or clip N (returns kind + value)
-          # Writes: MAP_KIND=(trailers|clips), MAP_TARGET=(tN or clip_url)
+          # Global mapping outputs (no eval!)
+          MAP_KIND=""
+          MAP_TARGET=""
+
           map_trailer_single() {
             local url="$1"
             local trailer="$2"
@@ -385,14 +377,14 @@ jobs:
             local count
             count="$(python tools/list_trailers.py --url "$url" $DEFAULT_FLAG | tail -n 1 | tr -d '\r\n')"
             if ! [[ "$count" =~ ^[0-9]+$ ]]; then
-              echo "MAP_KIND=trailers"
-              echo "MAP_TARGET=$trailer"
+              MAP_KIND="trailers"
+              MAP_TARGET="$trailer"
               return 0
             fi
 
             if (( idx < count )); then
-              echo "MAP_KIND=trailers"
-              echo "MAP_TARGET=$trailer"
+              MAP_KIND="trailers"
+              MAP_TARGET="$trailer"
               return 0
             fi
 
@@ -407,8 +399,8 @@ jobs:
               exit 1
             fi
 
-            echo "MAP_KIND=clips"
-            echo "MAP_TARGET=${clips[$idx]}"
+            MAP_KIND="clips"
+            MAP_TARGET="${clips[$idx]}"
             return 0
           }
 
@@ -472,8 +464,7 @@ jobs:
               exit 0
             fi
 
-            # custom single (tN may fallback to clip N)
-            eval "$(map_trailer_single "$URL" "$TRAILER")"
+            map_trailer_single "$URL" "$TRAILER"
             if [[ "$MAP_KIND" == "clips" ]]; then
               echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
               echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
@@ -595,8 +586,7 @@ jobs:
               exit 0
             fi
 
-            # preset single (tN may fallback to clip N)
-            eval "$(map_trailer_single "$URL" "$TRAILER")"
+            map_trailer_single "$URL" "$TRAILER"
             if [[ "$MAP_KIND" == "clips" ]]; then
               echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
               echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
@@ -625,7 +615,6 @@ jobs:
               exit 0
             fi
 
-            # normal single trailer on movie URL
             echo "DOWNLOAD_ALL=false" >> "$GITHUB_ENV"
             echo "PLAN_KIND=single" >> "$GITHUB_ENV"
 
