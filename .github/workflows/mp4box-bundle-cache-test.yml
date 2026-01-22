@@ -1,14 +1,17 @@
 name: MP4Box Bundle Cache Test
 
-# .github/workflows/mp4box-bundle-cache-test.yml @ v0.1.0
+# .github/workflows/mp4box-bundle-cache-test.yml @ v0.1.2
+#
 # Purpose:
 # - Build a portable-ish MP4Box (gpac) bundle on cache miss.
 # - On cache hit, skip apt install entirely (near 0 seconds).
 # - Run on a matrix of ubuntu-latest and ubuntu-22.04 to compare stability.
 #
-# Notes:
-# - This bundles MP4Box + its shared libs and runs via an LD_LIBRARY_PATH wrapper.
-# - Best stability is achieved by pinning runs-on to a specific Ubuntu version (often ubuntu-22.04).
+# v0.1.2 changes vs v0.1.1:
+# - Fix PATH activation on cache hit: $GITHUB_PATH only affects subsequent steps.
+#   This workflow now exports PATH inside the same step before calling MP4Box.
+# - Still writes to $GITHUB_PATH for subsequent steps (double-safe).
+# - Keep bundling GPAC modules into ~/.local/gpac-bundle/lib/gpac.
 
 on:
   workflow_dispatch:
@@ -44,7 +47,7 @@ jobs:
           echo "=== /etc/os-release ==="
           cat /etc/os-release || true
           echo "=== glibc (ldd) ==="
-          ldd --version | head -n 2 || true
+          (ldd --version 2>/dev/null | head -n 2) || true
           echo "=== runner image ==="
           echo "ImageOS=$ImageOS"
           echo "ImageVersion=$ImageVersion"
@@ -60,7 +63,7 @@ jobs:
           path: ~/.local/gpac-bundle
           key: gpac-bundle-${{ runner.os }}-${{ matrix.os }}-rev${{ inputs.bundle_rev }}
 
-      - name: Build gpac bundle on cache miss (apt + ldd bundle)
+      - name: Build gpac bundle on cache miss (apt + ldd bundle + gpac modules)
         if: ${{ steps.cache-gpac.outputs.cache-hit != 'true' }}
         run: |
           set -euo pipefail
@@ -79,10 +82,8 @@ jobs:
           LIB="$BUNDLE/lib"
           mkdir -p "$BIN" "$LIB"
 
-          # Copy the real binary
           cp -av "$MP4BOX_PATH" "$BIN/MP4Box.bin"
 
-          # Helper: copy lib real file + create symlink for requested SONAME if needed
           copy_lib() {
             local p="$1"
             if [[ -z "$p" ]]; then
@@ -102,46 +103,36 @@ jobs:
             local real_base
             real_base="$(basename "$real")"
 
-            # Copy real file
             if [[ ! -e "$LIB/$real_base" ]]; then
               cp -av "$real" "$LIB/"
             fi
 
-            # Create symlink for base name if different
             if [[ "$base" != "$real_base" ]]; then
               ln -sf "$real_base" "$LIB/$base"
             fi
           }
 
-          # Collect shared libs from ldd (ignore linux-vdso and "not found")
           echo "::group::ldd MP4Box.bin"
           ldd "$BIN/MP4Box.bin" || true
           echo "::endgroup::"
 
           missing=0
           while IFS= read -r line; do
-            # Examples:
-            #   libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x...)
-            #   /lib64/ld-linux-x86-64.so.2 (0x...)
-            #   linux-vdso.so.1 (0x...)
             if echo "$line" | grep -q "not found"; then
               echo "::error::Missing dependency: $line"
               missing=1
               continue
             fi
 
-            # Extract absolute paths
             p="$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) {print $i; exit}}')"
             if [[ -z "$p" ]]; then
               continue
             fi
 
-            # Skip vdso
             if echo "$p" | grep -q "linux-vdso"; then
               continue
             fi
 
-            # Copy it
             if ! copy_lib "$p"; then
               missing=1
             fi
@@ -152,7 +143,26 @@ jobs:
             exit 1
           fi
 
-          # Wrapper: ensure LD_LIBRARY_PATH points to bundle libs
+          # --- Bundle GPAC modules directory into $LIB/gpac ---
+          MOD_SRC=""
+          for d in /usr/lib/*/gpac /usr/lib/*/gpac/modules; do
+            if [[ -d "$d" ]]; then
+              MOD_SRC="$d"
+              break
+            fi
+          done
+          if [[ -z "$MOD_SRC" ]]; then
+            MOD_SRC="$(dpkg -L gpac 2>/dev/null | grep -E '/gpac(/modules)?$' | head -n 1 || true)"
+          fi
+
+          if [[ -n "$MOD_SRC" && -d "$MOD_SRC" ]]; then
+            echo "::notice::Bundling GPAC modules from: $MOD_SRC"
+            mkdir -p "$LIB/gpac"
+            cp -a "$MOD_SRC"/. "$LIB/gpac/" || true
+          else
+            echo "::warning::Could not locate GPAC modules directory to bundle (this may only affect plugin-based features)."
+          fi
+
           cat > "$BIN/MP4Box" <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -165,13 +175,28 @@ jobs:
           echo "::notice::Bundle built at $BUNDLE"
           echo "::group::Bundle tree"
           ls -la "$BIN"
-          ls -la "$LIB" | head -n 80 || true
+          echo "--- lib (top) ---"
+          ls -la "$LIB" | head -n 120 || true
+          echo "--- lib/gpac (top) ---"
+          ls -la "$LIB/gpac" 2>/dev/null | head -n 120 || true
           echo "::endgroup::"
 
       - name: Use MP4Box bundle (cache hit => no apt install)
         run: |
           set -euo pipefail
-          echo "$HOME/.local/gpac-bundle/bin" >> "$GITHUB_PATH"
+
+          BUNDLE_BIN="$HOME/.local/gpac-bundle/bin"
+
+          echo "::notice::Activating bundle bin path: $BUNDLE_BIN"
+          # Important: $GITHUB_PATH affects subsequent steps only.
+          # So we export PATH for this step, and also write to $GITHUB_PATH for later steps.
+          export PATH="$BUNDLE_BIN:$PATH"
+          echo "$BUNDLE_BIN" >> "$GITHUB_PATH"
+
+          echo "::group::Bundle sanity check"
+          ls -la "$BUNDLE_BIN" || true
+          echo "::endgroup::"
+
           command -v MP4Box
           MP4Box -version || true
 
@@ -180,9 +205,11 @@ jobs:
           set -euo pipefail
           MP4="$(command -v MP4Box)"
           echo "MP4Box wrapper: $MP4"
-          echo "::group::ldd wrapper target"
+
+          echo "::group::ldd MP4Box.bin"
           ldd "$HOME/.local/gpac-bundle/bin/MP4Box.bin" || true
           echo "::endgroup::"
+
           MP4Box -version || true
 
       - name: Upload gpac bundle artifact (optional)
