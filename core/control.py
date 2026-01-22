@@ -1,11 +1,12 @@
 import os
 import sys
 import shutil
+import re
+import unicodedata
 from rich.console import Console
 from rich import box
 from rich.table import Table
 from rich.columns import Columns
-from urllib.parse import urlparse
 
 from core.api import AppleTVPlus
 from core.api import get_hls
@@ -23,14 +24,20 @@ from core.tagger import tagFile
 
 from utils import logger, sanitize
 
-# core/control.py @ v2.3.3
-# Changes vs v2.3.2:
-# - Filename safety (artifact/windows-safe) double-guard:
-#     After assembling the full base filename (including [tN] and [clip-...]),
-#     sanitize the WHOLE base_name again to ensure no ":" etc can appear due to
-#     normalization effects or unexpected characters.
-# - Keep v2.3.2 human-readable logs (Preparing..., Output file: ...).
-# - Keep v2.3.1 collision avoidance: [tN] suffix + [clip-<id>] suffix for clip URLs.
+# core/control.py @ v2.4.0
+# Changes vs v2.3.3:
+# - Final delivery filename policy (user-friendly):
+#     "{MovieTitle} - {VideoTitle (dedup)} ({Year}) Apple-Trailer.mp4"
+#   * Keep year
+#   * Replace [ATVP]/[WEB-DL]/[t0]/[clip-...] with a single, human-readable suffix "Apple-Trailer"
+#     placed immediately before ".mp4".
+# - Deduplicate repeated title prefix in videoTitle:
+#     If videoTitle starts with title, remove that prefix so we don't get:
+#       "X - X Rogue Edition ..."
+# - No more "exists => skip". Instead auto-append (2), (3), ... to avoid overwriting:
+#     "... (2014) Apple-Trailer.mp4"
+#     "... (2014) (2) Apple-Trailer.mp4"
+# - Keep non-interactive / -F behavior unchanged.
 
 
 cons = Console()
@@ -90,34 +97,6 @@ def _select_trailers(trailers: list, trailer_arg: str, no_prompt: bool):
     return [trailers[idx]]
 
 
-def _normalize_trailer_tag(trailer_arg: str, fallback: str) -> str:
-    if not trailer_arg:
-        return fallback
-    ta = trailer_arg.strip().lower()
-    if ta in ("all", "a"):
-        return fallback
-    if ta.startswith("t"):
-        ta = ta[1:]
-    if ta.isdigit():
-        return f"t{int(ta)}"
-    return fallback
-
-
-def _clip_id_suffix_from_url(page_url: str):
-    try:
-        u = urlparse(page_url)
-        parts = [p for p in u.path.split("/") if p]
-        # parts: [storefront, kind, slug, id]
-        if len(parts) >= 4 and parts[1] == "clip":
-            last = parts[-1]
-            if last.startswith("umc.cmc."):
-                return last.split("umc.cmc.", 1)[1]
-            return last
-    except Exception:
-        pass
-    return None
-
-
 def _video_sort_key(t: dict):
     res = t.get("resolution") or (0, 0)
     try:
@@ -172,6 +151,7 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
     cons.print(f"\tMaster M3U8: [bold]{master_url}[/]")
     print()
 
+    # Video
     vtable = Table(box=box.ROUNDED)
     vtable.add_column("ID", justify="center")
     vtable.add_column("Codec", justify="left")
@@ -192,6 +172,7 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
             str(v.get("range")),
         )
 
+    # Audio
     atable = Table(box=box.ROUNDED)
     atable.add_column("ID", justify="center")
     atable.add_column("Codec", justify="left")
@@ -212,6 +193,7 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
             "YES" if a.get("isAD") else "NO",
         )
 
+    # Subs
     stable = Table(box=box.ROUNDED)
     stable.add_column("ID", justify="center")
     stable.add_column("Language", justify="center")
@@ -300,6 +282,105 @@ def _ensure_tools(selected_tracks: list):
         logger.error('Unable to find "ffmpeg" in PATH! (required for subtitle conversion)', 1)
 
 
+def _dedup_video_title_prefix(movie_title: str, video_title: str) -> str:
+    """
+    If video_title starts with movie_title, remove that prefix to avoid:
+      "Movie - Movie Something"
+    Conservative: only trims when the raw string startswith match is true.
+    """
+    mt = (movie_title or "").strip()
+    vt = (video_title or "").strip()
+    if not mt or not vt:
+        return vt
+
+    if vt.startswith(mt):
+        rest = vt[len(mt):].strip()
+        # Remove common separators after prefix
+        rest = rest.lstrip(" -–—:：|・･")
+        rest = rest.strip()
+        return rest
+
+    return vt
+
+
+def _build_delivery_basename(movie_title: str, video_title: str, year: str) -> str:
+    """
+    Build user-facing base name WITHOUT extension.
+    Result example:
+      "X-MENフューチャー&パスト - ローグ・エディション (字幕吹替) (2014) Apple-Trailer"
+    """
+    mt = sanitize(movie_title or "")
+    vt = sanitize(video_title or "")
+
+    # Dedup prefix (use pre-sanitized originals for correct slicing, but sanitize again later anyway)
+    vt2 = _dedup_video_title_prefix(movie_title or "", video_title or "")
+    vt2 = sanitize(vt2)
+
+    y = (year or "").strip()
+    if not y or not re.match(r"^\d{4}$", y):
+        y = "0000"
+
+    # Compose core title part
+    if vt2 and vt2 != mt:
+        core = f"{mt} - {vt2} ({y})"
+    else:
+        core = f"{mt} ({y})"
+
+    core = sanitize(core)
+    if not core:
+        core = "manzana_output"
+
+    # Required suffix right before extension
+    base = f"{core} Apple-Trailer"
+    base = sanitize(base)
+    if not base:
+        base = "manzana_output Apple-Trailer"
+
+    return base
+
+
+def _unique_output_path(base_no_ext: str, out_dir: str) -> str:
+    """
+    Ensure output filename uniqueness by appending (2), (3)... BEFORE 'Apple-Trailer'.
+    We keep 'Apple-Trailer' immediately before .mp4 as requested.
+    """
+    base_no_ext = sanitize(base_no_ext)
+    if not base_no_ext:
+        base_no_ext = "manzana_output Apple-Trailer"
+
+    suffix = " Apple-Trailer"
+    stem = base_no_ext
+    if stem.endswith(suffix):
+        stem_core = stem[: -len(suffix)].rstrip()
+    else:
+        # fallback: treat whole as stem_core
+        stem_core = stem
+
+    def make(n: int) -> str:
+        if n <= 1:
+            bn = f"{stem_core}{suffix}"
+        else:
+            bn = f"{stem_core} ({n}){suffix}"
+        bn = sanitize(bn)
+        if not bn:
+            bn = f"manzana_output ({n}){suffix}"
+        return os.path.join(out_dir, bn + ".mp4")
+
+    # Try without numbering first
+    p = make(1)
+    if not os.path.exists(p):
+        return p
+
+    # Then (2), (3)...
+    for i in range(2, 1000):
+        p2 = make(i)
+        if not os.path.exists(p2):
+            return p2
+
+    logger.error("Unable to find a free output filename (too many duplicates).", 1)
+    return make(9999)  # unreachable
+
+
 def run(args):
     try:
         atvp = AppleTVPlus()
@@ -312,60 +393,42 @@ def run(args):
 
         selected_trailers = _select_trailers(trailers, args.trailer, args.noPrompt)
 
-        # For clip URLs, append a clip id suffix to filename (avoids collisions across multiple clips)
-        clip_suffix = _clip_id_suffix_from_url(args.url)
-
         for ti, item in enumerate(selected_trailers):
-            trailer_tag = _normalize_trailer_tag(args.trailer, fallback=f"t{ti}")
-            trailer_hint = trailer_tag
-
             master_url = item["hlsUrl"]
 
             # list formats mode
             if args.listFormats:
-                logger.info(f'Listing formats for [{trailer_tag}] {item.get("title","")} | {item.get("videoTitle","")}')
+                logger.info(f'Listing formats for {item.get("title","")} | {item.get("videoTitle","")}')
                 hls = get_hls(master_url)
                 indexed = _index_tracks(hls)
+                trailer_hint = args.trailer if args.trailer else f"t{ti}"
                 _print_formats(item, master_url, indexed, args.url, trailer_hint)
                 print("-" * 30)
                 continue
 
             year = str(item.get("releaseDate") or "")[0:4] or "0000"
-
-            base_name_raw = "{} - {} ({}) Trailer [WEB-DL] [ATVP] [{}]".format(
-                sanitize(item.get("title") or ""),
-                sanitize(item.get("videoTitle") or ""),
-                year,
-                trailer_tag,
+            base = _build_delivery_basename(
+                movie_title=str(item.get("title") or ""),
+                video_title=str(item.get("videoTitle") or ""),
+                year=year,
             )
 
-            if clip_suffix:
-                base_name_raw += f" [clip-{sanitize(clip_suffix)}]"
+            op = _unique_output_path(base, OUTPUTDIR)
 
-            # NEW (v2.3.3): sanitize the FULL name as a final guard (Windows/artifact safe)
-            base_name = sanitize(base_name_raw)
-            if not base_name:
-                base_name = "manzana_output"
-
-            op = os.path.join(OUTPUTDIR, base_name + ".mp4")
-
-            # explicit human-readable logs
-            logger.info(f'Preparing [{trailer_tag}] {item.get("title","")} | {item.get("videoTitle","")}')
+            # human-readable logs
+            logger.info(f'Preparing {item.get("title","")} | {item.get("videoTitle","")}')
             logger.info(f"Output file: {os.path.basename(op)}")
-
-            if os.path.exists(op):
-                logger.info(f'"{os.path.basename(op)}" is already exists! Skipping...')
-                print("-" * 30)
-                continue
 
             hls = get_hls(master_url)
             indexed = _index_tracks(hls)
 
+            # If -f is provided => non-interactive selection
             if args.format:
                 if args.noAudio or args.noSubs:
                     logger.warning('"-f/--format" provided; ignoring --no-audio/--no-subs')
                 userReq = _select_by_format(args.format, indexed)
             else:
+                # Legacy interactive mode (only if allowed)
                 if args.noPrompt or (not sys.stdin.isatty()):
                     logger.error('Non-interactive mode: please use -F to list formats and -f to select.', 1)
 
