@@ -1,17 +1,14 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.6.4
-# Changes vs v1.6.3:
-# - When clip fallback is used (COUNT<=1), call:
-#     tools/list_clip_urls.py --resolve-titles
-#   so Actions logs show human-readable clip names (e.g. 吹替版/字幕版) during:
-#     * Phase 1 (optional visibility)
-#     * Compute EFFECTIVE_FORMAT / PLAN (main visibility)
-# - All other behavior stays the same as v1.6.3:
-#     * Phase 1 -F dedup (no duplicated listings)
-#     * custom mode supports trailer=all expansion (trailers or clip fallback)
-#     * preset modes support clip fallback when API list is incomplete
-#     * continue-on-failure semantics for downloads (warn summary, all-fail -> exit 1)
+# .github/workflows/manzana-download.yml @ v1.6.5
+# Changes vs v1.6.4:
+# - Use ::group:: / ::endgroup:: to fold verbose outputs:
+#   * Phase 1: each trailer/clip -F output is grouped
+#   * Phase 2: each trailer/clip download output is grouped
+# - Continue to call list_clip_urls.py with --resolve-titles for human-readable names,
+#   but titles are now resolved via HTML first (tools/list_clip_urls.py @ v0.1.2),
+#   greatly reducing API-500 noise.
+# - No change to planning/download semantics from v1.6.4/v1.6.3.
 
 on:
   workflow_dispatch:
@@ -209,7 +206,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Phase 1 - List formats (-F) and save to formats.txt (dedup, all modes)
+      - name: Phase 1 - List formats (-F) and save to formats.txt (dedup, grouped)
         run: |
           set -euo pipefail
 
@@ -226,13 +223,17 @@ jobs:
 
           if [[ "$DEFAULT_ONLY" == "true" ]]; then
             echo "========== DEFAULT (single) ==========" | tee -a formats.txt
+            echo "::group::Formats (default)"
             python manzana.py --default --no-prompt --trailer "$TRAILER" -F "$URL" | tee -a formats.txt
+            echo "::endgroup::"
             exit 0
           fi
 
           if ! [[ "$TRAILER" =~ ^(all|a)$ ]]; then
             echo "========== TRAILER $TRAILER ==========" | tee -a formats.txt
+            echo "::group::Formats ($TRAILER)"
             python manzana.py --no-prompt --trailer "$TRAILER" -F "$URL" | tee -a formats.txt
+            echo "::endgroup::"
             exit 0
           fi
 
@@ -240,7 +241,9 @@ jobs:
           if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
             echo "::warning::Unable to parse trailer count for Phase 1; falling back to listing t0 only."
             echo "========== TRAILER t0 (fallback) ==========" | tee -a formats.txt
+            echo "::group::Formats (t0 fallback)"
             python manzana.py --no-prompt --trailer t0 -F "$URL" | tee -a formats.txt
+            echo "::endgroup::"
             exit 0
           fi
 
@@ -249,20 +252,24 @@ jobs:
             for ((i=0;i<COUNT;i++)); do
               echo "" | tee -a formats.txt
               echo "========== TRAILER t${i} ==========" | tee -a formats.txt
+              echo "::group::Formats (t${i})"
               python manzana.py --no-prompt --trailer "t${i}" -F "$URL" | tee -a formats.txt
+              echo "::endgroup::"
             done
             exit 0
           fi
 
           echo "========== ALL (clip fallback) ==========" | tee -a formats.txt
 
-          # v1.6.4: --resolve-titles (stderr only) so Actions logs show clip names
+          # Resolve titles via HTML first (quiet) and print names to stderr for logs.
           mapfile -t CLIPS_RAW < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG --resolve-titles)
 
           if [[ ${#CLIPS_RAW[@]} -le 0 ]]; then
             echo "::warning::Clip fallback found 0 clip URLs. Listing trailer t0 as last resort." | tee -a formats.txt
             echo "========== TRAILER t0 (fallback) ==========" | tee -a formats.txt
+            echo "::group::Formats (t0 fallback)"
             python manzana.py --no-prompt --trailer t0 -F "$URL" | tee -a formats.txt
+            echo "::endgroup::"
             exit 0
           fi
 
@@ -285,7 +292,15 @@ jobs:
           for clip_url in "${CLIPS[@]}"; do
             echo "" | tee -a formats.txt
             echo "========== CLIP: $clip_url ==========" | tee -a formats.txt
+
+            clip_id="$(echo "$clip_url" | sed -n 's|.*/umc\.cmc\.\([^?&/]*\).*|\1|p')"
+            if [[ -z "$clip_id" ]]; then
+              clip_id="unknown"
+            fi
+
+            echo "::group::Formats (clip-$clip_id)"
             python manzana.py --no-prompt --trailer t0 -F "$clip_url" | tee -a formats.txt
+            echo "::endgroup::"
           done
 
       - name: Upload formats as artifact (manzana-formats)
@@ -344,11 +359,9 @@ jobs:
                 echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
                 echo "PLAN_KIND=trailers" >> "$GITHUB_ENV"
                 echo "::notice::custom mode + trailer=all -> API trailers count=$COUNT (t0..t$((COUNT-1))). Using the SAME format for each."
-
                 for ((i=0;i<COUNT;i++)); do
                   echo "t${i} $F" >> "$PLAN_FILE"
                 done
-
                 echo "::notice::Computed plan (trailer -> format):"
                 cat "$PLAN_FILE"
                 exit 0
@@ -358,7 +371,6 @@ jobs:
               echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
               echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
 
-              # v1.6.4: --resolve-titles prints names to stderr for better logs
               mapfile -t CLIPS < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG --resolve-titles)
               if [[ ${#CLIPS[@]} -le 0 ]]; then
                 echo "::error::Clip fallback found 0 clip URLs. Unable to continue."
@@ -367,9 +379,7 @@ jobs:
 
               for clip_url in "${CLIPS[@]}"; do
                 clip_url="$(printf "%s" "$clip_url" | tr -d '\r\n')"
-                if [[ -z "$clip_url" ]]; then
-                  continue
-                fi
+                [[ -z "$clip_url" ]] && continue
                 echo "$clip_url $F" >> "$PLAN_FILE"
               done
 
@@ -400,41 +410,26 @@ jobs:
                 echo "::notice::preset mode + trailer=all -> API trailers count=$COUNT (t0..t$((COUNT-1)))."
 
                 sel_failed=()
-
                 for ((i=0;i<COUNT;i++)); do
                   TID="t${i}"
                   set +e
                   if [[ "$MODE" == "preset_av" ]]; then
-                    EFF="$(python tools/select_format.py \
-                      --url "$URL" \
-                      --trailer "$TID" \
-                      $DEFAULT_FLAG \
-                      --mode preset_av \
-                      --preset-av-profile "${{ inputs.preset_av_profile }}" \
-                      --audio-lang "${{ inputs.audio_lang }}" \
-                      --sub-lang "${{ inputs.sub_lang }}" \
-                    | tail -n 1 | tr -d '\r\n')"
+                    EFF="$(python tools/select_format.py --url "$URL" --trailer "$TID" $DEFAULT_FLAG --mode preset_av \
+                      --preset-av-profile "${{ inputs.preset_av_profile }}" --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
+                      | tail -n 1 | tr -d '\r\n')"
                   else
-                    EFF="$(python tools/select_format.py \
-                      --url "$URL" \
-                      --trailer "$TID" \
-                      $DEFAULT_FLAG \
-                      --mode preset_video \
-                      --preset-video-profile "${{ inputs.preset_video_profile }}" \
-                      --audio-quality "${{ inputs.audio_quality }}" \
-                      --audio-lang "${{ inputs.audio_lang }}" \
-                      --sub-lang "${{ inputs.sub_lang }}" \
-                    | tail -n 1 | tr -d '\r\n')"
+                    EFF="$(python tools/select_format.py --url "$URL" --trailer "$TID" $DEFAULT_FLAG --mode preset_video \
+                      --preset-video-profile "${{ inputs.preset_video_profile }}" --audio-quality "${{ inputs.audio_quality }}" \
+                      --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
+                      | tail -n 1 | tr -d '\r\n')"
                   fi
                   RC=$?
                   set -e
-
                   if [[ $RC -ne 0 || -z "$EFF" ]]; then
                     sel_failed+=("$TID")
                     echo "::warning::Selector failed for $TID (skipping)."
                     continue
                   fi
-
                   echo "$TID $EFF" >> "$PLAN_FILE"
                 done
 
@@ -454,9 +449,7 @@ jobs:
                 echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
                 echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
 
-                # v1.6.4: --resolve-titles prints names to stderr for better logs
                 mapfile -t CLIPS < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG --resolve-titles)
-
                 if [[ ${#CLIPS[@]} -le 0 ]]; then
                   echo "::error::Clip fallback found 0 clip URLs. Unable to continue."
                   exit 1
@@ -467,32 +460,18 @@ jobs:
 
                 for clip_url in "${CLIPS[@]}"; do
                   clip_url="$(printf "%s" "$clip_url" | tr -d '\r\n')"
-                  if [[ -z "$clip_url" ]]; then
-                    continue
-                  fi
+                  [[ -z "$clip_url" ]] && continue
 
                   set +e
                   if [[ "$MODE" == "preset_av" ]]; then
-                    EFF="$(python tools/select_format.py \
-                      --url "$clip_url" \
-                      --trailer t0 \
-                      $DEFAULT_FLAG \
-                      --mode preset_av \
-                      --preset-av-profile "${{ inputs.preset_av_profile }}" \
-                      --audio-lang "${{ inputs.audio_lang }}" \
-                      --sub-lang "${{ inputs.sub_lang }}" \
-                    | tail -n 1 | tr -d '\r\n')"
+                    EFF="$(python tools/select_format.py --url "$clip_url" --trailer t0 $DEFAULT_FLAG --mode preset_av \
+                      --preset-av-profile "${{ inputs.preset_av_profile }}" --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
+                      | tail -n 1 | tr -d '\r\n')"
                   else
-                    EFF="$(python tools/select_format.py \
-                      --url "$clip_url" \
-                      --trailer t0 \
-                      $DEFAULT_FLAG \
-                      --mode preset_video \
-                      --preset-video-profile "${{ inputs.preset_video_profile }}" \
-                      --audio-quality "${{ inputs.audio_quality }}" \
-                      --audio-lang "${{ inputs.audio_lang }}" \
-                      --sub-lang "${{ inputs.sub_lang }}" \
-                    | tail -n 1 | tr -d '\r\n')"
+                    EFF="$(python tools/select_format.py --url "$clip_url" --trailer t0 $DEFAULT_FLAG --mode preset_video \
+                      --preset-video-profile "${{ inputs.preset_video_profile }}" --audio-quality "${{ inputs.audio_quality }}" \
+                      --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
+                      | tail -n 1 | tr -d '\r\n')"
                   fi
                   RC=$?
                   set -e
@@ -523,26 +502,14 @@ jobs:
               echo "PLAN_KIND=single" >> "$GITHUB_ENV"
 
               if [[ "$MODE" == "preset_av" ]]; then
-                EFF="$(python tools/select_format.py \
-                  --url "$URL" \
-                  --trailer "$TRAILER" \
-                  $DEFAULT_FLAG \
-                  --mode preset_av \
-                  --preset-av-profile "${{ inputs.preset_av_profile }}" \
-                  --audio-lang "${{ inputs.audio_lang }}" \
-                  --sub-lang "${{ inputs.sub_lang }}" \
-                | tail -n 1 | tr -d '\r\n')"
+                EFF="$(python tools/select_format.py --url "$URL" --trailer "$TRAILER" $DEFAULT_FLAG --mode preset_av \
+                  --preset-av-profile "${{ inputs.preset_av_profile }}" --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
+                  | tail -n 1 | tr -d '\r\n')"
               else
-                EFF="$(python tools/select_format.py \
-                  --url "$URL" \
-                  --trailer "$TRAILER" \
-                  $DEFAULT_FLAG \
-                  --mode preset_video \
-                  --preset-video-profile "${{ inputs.preset_video_profile }}" \
-                  --audio-quality "${{ inputs.audio_quality }}" \
-                  --audio-lang "${{ inputs.audio_lang }}" \
-                  --sub-lang "${{ inputs.sub_lang }}" \
-                | tail -n 1 | tr -d '\r\n')"
+                EFF="$(python tools/select_format.py --url "$URL" --trailer "$TRAILER" $DEFAULT_FLAG --mode preset_video \
+                  --preset-video-profile "${{ inputs.preset_video_profile }}" --audio-quality "${{ inputs.audio_quality }}" \
+                  --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
+                  | tail -n 1 | tr -d '\r\n')"
               fi
 
               if [[ -z "$EFF" ]]; then
@@ -596,7 +563,7 @@ jobs:
           command -v MP4Box
           MP4Box -version || true
 
-      - name: Phase 2 - Download (custom single / custom all / preset single / preset all + clip fallback)
+      - name: Phase 2 - Download (custom single / custom all / preset single / preset all + clip fallback) [grouped]
         if: ${{ env.DO_DOWNLOAD == 'true' }}
         env:
           PYTHONUNBUFFERED: "1"
@@ -629,17 +596,21 @@ jobs:
             echo "::notice::Downloading multiple items (continue on failures). PLAN_KIND=$PLAN_KIND MODE=$MODE"
 
             while read -r target fmt; do
-              if [[ -z "$target" || -z "$fmt" ]]; then
-                continue
-              fi
+              [[ -z "$target" || -z "$fmt" ]] && continue
 
               if [[ "$PLAN_KIND" == "clips" ]]; then
                 clip_url="$target"
+                clip_id="$(echo "$clip_url" | sed -n 's|.*/umc\.cmc\.\([^?&/]*\).*|\1|p')"
+                [[ -z "$clip_id" ]] && clip_id="unknown"
+
+                echo "::group::Download (clip-$clip_id) fmt=$fmt"
                 echo "::notice::Downloading clip URL with format=$fmt"
                 set +e
                 python manzana.py "${default_args[@]}" --no-prompt --trailer t0 -f "$fmt" "$clip_url"
                 rc=$?
                 set -e
+                echo "::endgroup::"
+
                 if [[ $rc -ne 0 ]]; then
                   failures+=("$clip_url")
                   echo "::warning::Download failed for clip (rc=$rc). Continuing..."
@@ -648,11 +619,14 @@ jobs:
                 fi
               else
                 tid="$target"
+                echo "::group::Download ($tid) fmt=$fmt"
                 echo "::notice::Downloading $tid with format=$fmt"
                 set +e
                 python manzana.py "${default_args[@]}" --no-prompt --trailer "$tid" -f "$fmt" "$URL"
                 rc=$?
                 set -e
+                echo "::endgroup::"
+
                 if [[ $rc -ne 0 ]]; then
                   failures+=("$tid")
                   echo "::warning::Download failed for $tid (rc=$rc). Continuing..."
@@ -661,10 +635,11 @@ jobs:
                 fi
               fi
             done < "$PLAN_FILE"
-
           else
+            echo "::group::Download (single) trailer=$TRAILER fmt=$EFF"
             echo "::notice::Downloading single trailer $TRAILER with format=$EFF"
             python manzana.py "${default_args[@]}" --no-prompt --trailer "$TRAILER" -f "$EFF" "$URL"
+            echo "::endgroup::"
             success_count=1
           fi
 
