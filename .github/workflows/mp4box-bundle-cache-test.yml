@@ -1,15 +1,15 @@
 name: MP4Box Bundle Cache Test
 
-# .github/workflows/mp4box-bundle-cache-test.yml @ v0.1.3
+# .github/workflows/mp4box-bundle-cache-test.yml @ v0.1.4
 #
 # Purpose:
 # - Build a portable-ish MP4Box (gpac) bundle on cache miss.
 # - On cache hit, skip apt install entirely (near 0 seconds).
 # - Run on a matrix of ubuntu-latest and ubuntu-22.04 to compare stability.
 #
-# v0.1.3 changes vs v0.1.2:
-# - Quick runtime check: run ldd with LD_LIBRARY_PATH pointing to bundle/lib (realistic).
-# - Fail the step if "not found" appears in ldd output (strict dependency validation).
+# v0.1.4 changes vs v0.1.3:
+# - Cache key now includes real Ubuntu VERSION_ID (e.g., 22.04/24.04), not ubuntu-latest alias.
+#   This prevents incorrect cache reuse when ubuntu-latest upgrades (e.g., 24.04 -> 26.04).
 
 on:
   workflow_dispatch:
@@ -54,12 +54,19 @@ jobs:
           echo "=== PATH ==="
           echo "$PATH"
 
+      - name: Detect Ubuntu VERSION_ID (for stable cache key)
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          echo "UBUNTU_VERSION_ID=$VERSION_ID" >> "$GITHUB_ENV"
+          echo "Detected UBUNTU_VERSION_ID=$VERSION_ID"
+
       - name: Cache MP4Box bundle
         id: cache-gpac
         uses: actions/cache@v4
         with:
           path: ~/.local/gpac-bundle
-          key: gpac-bundle-${{ runner.os }}-${{ matrix.os }}-rev${{ inputs.bundle_rev }}
+          key: gpac-bundle-${{ runner.os }}-ubuntu${{ env.UBUNTU_VERSION_ID }}-${{ runner.arch }}-rev${{ inputs.bundle_rev }}
 
       - name: Build gpac bundle on cache miss (apt + ldd bundle + gpac modules)
         if: ${{ steps.cache-gpac.outputs.cache-hit != 'true' }}
@@ -189,8 +196,7 @@ jobs:
           BUNDLE_BIN="$HOME/.local/gpac-bundle/bin"
 
           echo "::notice::Activating bundle bin path: $BUNDLE_BIN"
-          # Important: $GITHUB_PATH affects subsequent steps only.
-          # So we export PATH for this step, and also write to $GITHUB_PATH for later steps.
+          # $GITHUB_PATH affects subsequent steps only; export PATH for this step too.
           export PATH="$BUNDLE_BIN:$PATH"
           echo "$BUNDLE_BIN" >> "$GITHUB_PATH"
 
@@ -220,7 +226,6 @@ jobs:
             exit 1
           fi
 
-          # Actual run (also with LD_LIBRARY_PATH set, matching wrapper behavior)
           MP4Box -version || true
 
       - name: Upload gpac bundle artifact (optional)
