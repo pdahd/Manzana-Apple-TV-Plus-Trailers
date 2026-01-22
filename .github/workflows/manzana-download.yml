@@ -1,14 +1,10 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.6.5
-# Changes vs v1.6.4:
-# - Use ::group:: / ::endgroup:: to fold verbose outputs:
-#   * Phase 1: each trailer/clip -F output is grouped
-#   * Phase 2: each trailer/clip download output is grouped
-# - Continue to call list_clip_urls.py with --resolve-titles for human-readable names,
-#   but titles are now resolved via HTML first (tools/list_clip_urls.py @ v0.1.2),
-#   greatly reducing API-500 noise.
-# - No change to planning/download semantics from v1.6.4/v1.6.3.
+# .github/workflows/manzana-download.yml @ v1.6.7
+# Changes vs v1.6.6:
+# - Inspect step: replace Python heredoc with sha1sum one-liner to compute safe report ids.
+#   This avoids GitHub editor YAML warnings and is simpler/robust.
+# - All other behaviors preserved (grouped logs, clip fallback, custom all expansion, Phase 1 dedup, resolve titles).
 
 on:
   workflow_dispatch:
@@ -261,7 +257,6 @@ jobs:
 
           echo "========== ALL (clip fallback) ==========" | tee -a formats.txt
 
-          # Resolve titles via HTML first (quiet) and print names to stderr for logs.
           mapfile -t CLIPS_RAW < <(python tools/list_clip_urls.py --url "$URL" $DEFAULT_FLAG --resolve-titles)
 
           if [[ ${#CLIPS_RAW[@]} -le 0 ]]; then
@@ -393,8 +388,9 @@ jobs:
             echo "PLAN_KIND=single" >> "$GITHUB_ENV"
             echo "mode=custom: will download with format: $F"
             exit 0
+          fi
 
-          elif [[ "$MODE" == "preset_av" || "$MODE" == "preset_video" ]]; then
+          if [[ "$MODE" == "preset_av" || "$MODE" == "preset_video" ]]; then
             echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
 
             if [[ "$TRAILER" =~ ^(all|a)$ ]]; then
@@ -443,7 +439,6 @@ jobs:
                 if [[ ${#sel_failed[@]} -gt 0 ]]; then
                   echo "::warning::Selector failed for trailers: ${sel_failed[*]}"
                 fi
-
               else
                 echo "::notice::API trailer count=$COUNT (<=1). Falling back to clip URLs from HTML..."
                 echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
@@ -496,7 +491,6 @@ jobs:
                   echo "::warning::Selector failed for some clip URLs (${#sel_failed[@]})."
                 fi
               fi
-
             else
               echo "DOWNLOAD_ALL=false" >> "$GITHUB_ENV"
               echo "PLAN_KIND=single" >> "$GITHUB_ENV"
@@ -520,11 +514,11 @@ jobs:
               echo "EFFECTIVE_FORMAT=$EFF" >> "$GITHUB_ENV"
               echo "::notice::preset mode -> computed format: $EFF"
             fi
-
-          else
-            echo "::error::Unknown mode '$MODE'"
-            exit 1
+            exit 0
           fi
+
+          echo "::error::Unknown mode '$MODE'"
+          exit 1
 
       - name: Cache FFmpeg (BtbN)
         if: ${{ env.DO_DOWNLOAD == 'true' }}
@@ -572,12 +566,12 @@ jobs:
 
           URL="${{ inputs.url }}"
           DEFAULT_ONLY="${{ inputs.default_only }}"
-          TRAILER="${{ inputs.trailer }}"
           MODE="${{ inputs.mode }}"
           DOWNLOAD_ALL="${{ env.DOWNLOAD_ALL }}"
           PLAN_KIND="${{ env.PLAN_KIND }}"
           PLAN_FILE="${{ env.FORMAT_PLAN_FILE }}"
           EFF="${{ env.EFFECTIVE_FORMAT }}"
+          TRAILER="${{ inputs.trailer }}"
 
           default_args=()
           if [[ "$DEFAULT_ONLY" == "true" ]]; then
@@ -655,10 +649,14 @@ jobs:
             done
           fi
 
-      - name: Inspect output media info (ffprobe summary + JSON)
+      - name: Inspect output media info (ffprobe summary + JSON) [safe report names]
         if: ${{ env.DO_DOWNLOAD == 'true' }}
         run: |
+          set -euo pipefail
+
           mkdir -p report
+          : > report/manifest.tsv
+
           shopt -s nullglob
           files=(output/*.mp4)
           if [ ${#files[@]} -eq 0 ]; then
@@ -669,6 +667,10 @@ jobs:
           for f in "${files[@]}"; do
             base="$(basename "$f")"
             echo "=== Inspecting: $base ==="
+
+            # Safe id (12 hex chars) derived from filename. Works across all filesystems for upload-artifact.
+            sid="$(printf '%s' "$base" | sha1sum | awk '{print substr($1,1,12)}')"
+            printf '%s\t%s\n' "$sid" "$base" >> report/manifest.tsv
 
             echo "--- FORMAT (container) ---"
             ffprobe -hide_banner -v error \
@@ -683,8 +685,11 @@ jobs:
             echo "--- JSON (artifact) ---"
             ffprobe -hide_banner -v error \
               -show_format -show_streams \
-              -print_format json "$f" > "report/${base}.ffprobe.json"
+              -print_format json "$f" > "report/${sid}.ffprobe.json"
           done
+
+          echo "=== Report manifest ==="
+          cat report/manifest.tsv
 
       - name: Upload inspection report as artifact (manzana-report)
         if: ${{ env.DO_DOWNLOAD == 'true' }}
