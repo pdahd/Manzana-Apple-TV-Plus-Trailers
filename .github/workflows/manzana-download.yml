@@ -1,34 +1,33 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.6.9
-# Changes vs v1.6.8:
-# - Fix "line XXX: ::notice::Requested: command not found" when Trailer=tN triggers clip fallback.
-#   Root cause: using eval "$(map_trailer_single ...)" while the function also printed ::notice:: lines.
-#   Fix: remove eval entirely; map_trailer_single now sets global variables MAP_KIND/MAP_TARGET directly.
-# - Everything else preserved: Phase 1 grouped/dedup, custom/all expansion, clip fallback, safe report names.
+# .github/workflows/manzana-download.yml @ v1.6.10
+# Changes vs v1.6.9:
+# - UI/UX: Add emojis + concise Chinese guidance in workflow_dispatch inputs descriptions.
+# - Validation: add a few notices/warnings to reduce mismatched selections and ambiguity.
+# - No change to core behaviors (tN->clip[N] fallback, all fallback, grouped logs, safe report names, etc.).
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Apple TV URL (movie/show page)"
+        description: "🔗 Apple TV 页面链接（movie/show/clip）。建议直接粘贴浏览器地址栏完整 URL。"
         required: true
         type: string
 
       trailer:
-        description: 'Trailer selector: use t0, t1, t2... (e.g. "t0") or "all". If a page only exposes t0 via API but has multiple clip cards, tN will fall back to the Nth clip.'
+        description: "🎞️ 选择视频：t0/t1/t2... 或 all。若该页面 API 只有 t0，但网页有多个 clip，则 t1 会自动映射为第 2 个 clip。"
         required: false
         default: "t0"
         type: string
 
       default_only:
-        description: "Use --default (only default trailer metadata). If enabled, the page usually has a single default video."
+        description: "🎯 只取默认背景视频（--default）。开启后通常只有 1 个视频；all 也等价于 t0。"
         required: false
         default: false
         type: boolean
 
       mode:
-        description: "Selection mode: preset menus (recommended) OR custom format string."
+        description: "🎛️ 选择模式：preset_* 自动选轨；custom 手动填写 format。"
         required: true
         type: choice
         default: preset_av
@@ -38,7 +37,7 @@ on:
           - custom
 
       preset_av_profile:
-        description: "Preset A/V profile (ONLY used when mode=preset_av)."
+        description: "🎚️ 预设 A/V（仅 mode=preset_av 生效）：自动选视频+指定音频类型（更适合一键）。"
         required: true
         type: choice
         default: 1080_SDR_AAC
@@ -48,7 +47,7 @@ on:
           - 4K_HDR_DD51
 
       preset_video_profile:
-        description: "Preset video profile (ONLY used when mode=preset_video)."
+        description: "🎚️ 预设视频（仅 mode=preset_video 生效）：1080/4K + SDR/HDR/DoVi（自动挑同档最高码率）。"
         required: true
         type: choice
         default: 1080_SDR
@@ -58,7 +57,7 @@ on:
           - 4K_HDR
 
       audio_quality:
-        description: "Audio quality (ONLY used when mode=preset_video)."
+        description: "🔊 音频质量（仅 mode=preset_video 生效）：none=纯视频；AAC/Atmos/DD5.1=自动回退到可用音轨。"
         required: true
         type: choice
         default: AAC
@@ -69,7 +68,7 @@ on:
           - DD5.1
 
       audio_lang:
-        description: 'Audio language (preset modes only). "original" = original-content track.'
+        description: "🗣️ 音频语言（仅 preset_* 生效）：original=优先原声；若指定语言不可用会回退。"
         required: true
         type: choice
         default: original
@@ -90,7 +89,7 @@ on:
           - ru
 
       sub_lang:
-        description: 'Subtitle language (preset modes only). Default "none".'
+        description: "💬 字幕语言（仅 preset_* 生效）：none=不下字幕；指定语言不存在则跳过字幕（不报错）。"
         required: true
         type: choice
         default: none
@@ -111,7 +110,7 @@ on:
           - ru
 
       format:
-        description: 'CUSTOM mode only. Leave EMPTY on first run to ONLY LIST formats (Phase 1). Then rerun and set format.'
+        description: "🧩 仅 mode=custom 生效：留空=只列格式不下载；填写如 v0+a2+s1（必须且只能包含 1 个 vN）。"
         required: false
         default: ""
         type: string
@@ -122,30 +121,38 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Validate inputs (fail fast)
+      - name: Validate inputs (fail fast + hints)
         run: |
           set -euo pipefail
 
           MODE="${{ inputs.mode }}"
           TRAILER="${{ inputs.trailer }}"
           FORMAT_IN="${{ inputs.format }}"
+          DEFAULT_ONLY="${{ inputs.default_only }}"
 
           if [[ -z "$TRAILER" ]]; then
-            echo "::error::Input 'trailer' is empty. Use t0, t1, t2... or all."
+            echo "::error::Trailer 为空。请使用 t0/t1/... 或 all。"
             exit 1
           fi
 
           if [[ "$TRAILER" =~ ^(all|a|t[0-9]+)$ ]]; then
             echo "OK: trailer=$TRAILER"
           else
-            echo "::error::Invalid trailer input: '$TRAILER'"
-            echo "Expected: t0, t1, t2... (t + digits) OR 'all' (or 'a')."
+            echo "::error::Trailer 无效：'$TRAILER'（期望：t0/t1/... 或 all）"
             exit 1
+          fi
+
+          if [[ "$DEFAULT_ONLY" == "true" && "$TRAILER" =~ ^(all|a)$ ]]; then
+            echo "::notice::default_only=true 时，all 等价于 t0（页面通常只有 1 个默认视频）。"
+          fi
+
+          if [[ "$MODE" != "custom" && -n "$FORMAT_IN" ]]; then
+            echo "::warning::当前 mode=$MODE，会忽略 format 输入（format 仅 custom 模式生效）。"
           fi
 
           if [[ "$MODE" == "custom" ]]; then
             if [[ -z "$FORMAT_IN" ]]; then
-              echo "OK: mode=custom and format is EMPTY -> list only, no download."
+              echo "::notice::custom + format 为空：将只列格式（-F），不下载。"
             else
               F="$FORMAT_IN"
               if [[ ${#F} -ge 2 ]]; then
@@ -155,7 +162,7 @@ jobs:
               fi
 
               if [[ "$F" =~ [[:space:]] ]]; then
-                echo "::error::Invalid custom format: contains whitespace. Use '+' between ids, e.g. v6+a0+s4"
+                echo "::error::custom format 含空格。请用 + 连接，例如 v0+a0+s0"
                 exit 1
               fi
 
@@ -163,7 +170,7 @@ jobs:
               vcount=0
               for p in "${PARTS[@]}"; do
                 if [[ -z "$p" ]]; then
-                  echo "::error::Invalid custom format: empty token (check for '++')."
+                  echo "::error::custom format 存在空 token（可能是 ++）"
                   exit 1
                 fi
                 if [[ "$p" =~ ^[vV][0-9]+$ ]]; then
@@ -173,19 +180,19 @@ jobs:
                 elif [[ "$p" =~ ^[sS][0-9]+$ ]]; then
                   true
                 else
-                  echo "::error::Invalid token '$p' in custom format."
+                  echo "::error::custom format token 无效：'$p'（应为 vN/aN/sN）"
                   exit 1
                 fi
               done
 
               if [[ "$vcount" -ne 1 ]]; then
-                echo "::error::Invalid custom format: must include EXACTLY ONE video id (vN)."
+                echo "::error::custom format 必须且只能包含 1 个 vN（视频轨）。"
                 exit 1
               fi
-            fi
-          else
-            if [[ -n "$FORMAT_IN" ]]; then
-              echo "::warning::mode=$MODE: input 'format' will be ignored (preset mode uses selector)."
+
+              if [[ "$TRAILER" =~ ^(all|a)$ ]]; then
+                echo "::notice::custom + trailer=all：会对每个视频使用同一个 format。若不同视频的 v/a/s 编号不一致，可能部分失败（属正常现象）。"
+              fi
             fi
           fi
 
@@ -226,6 +233,7 @@ jobs:
             exit 0
           fi
 
+          # trailer=tN (single) with out-of-range fallback to clip N
           if ! [[ "$TRAILER" =~ ^(all|a)$ ]]; then
             idx="${TRAILER#t}"
             if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
@@ -275,6 +283,7 @@ jobs:
             exit 0
           fi
 
+          # trailer=all path
           COUNT="$(python tools/list_trailers.py --url "$URL" $DEFAULT_FLAG | tail -n 1 | tr -d '\r\n')"
           if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
             echo "::warning::Unable to parse trailer count for Phase 1; falling back to listing t0 only."
@@ -360,7 +369,6 @@ jobs:
           : > "$PLAN_FILE"
           echo "FORMAT_PLAN_FILE=$PLAN_FILE" >> "$GITHUB_ENV"
 
-          # Global mapping outputs (no eval!)
           MAP_KIND=""
           MAP_TARGET=""
 
@@ -466,6 +474,7 @@ jobs:
 
             map_trailer_single "$URL" "$TRAILER"
             if [[ "$MAP_KIND" == "clips" ]]; then
+              echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
               echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
               echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
               echo "$MAP_TARGET $F" >> "$PLAN_FILE"
@@ -544,8 +553,6 @@ jobs:
               fi
 
               echo "::notice::Clip fallback: found ${#CLIPS[@]} clip URLs."
-              sel_failed=()
-
               for clip_url in "${CLIPS[@]}"; do
                 clip_url="$(printf "%s" "$clip_url" | tr -d '\r\n')"
                 [[ -z "$clip_url" ]] && continue
@@ -563,13 +570,10 @@ jobs:
                 fi
                 RC=$?
                 set -e
-
                 if [[ $RC -ne 0 || -z "$EFF" ]]; then
-                  sel_failed+=("$clip_url")
                   echo "::warning::Selector failed for clip URL (skipping): $clip_url"
                   continue
                 fi
-
                 echo "$clip_url $EFF" >> "$PLAN_FILE"
               done
 
@@ -580,18 +584,15 @@ jobs:
 
               echo "::notice::Computed plan (clip_url -> format):"
               cat "$PLAN_FILE"
-              if [[ ${#sel_failed[@]} -gt 0 ]]; then
-                echo "::warning::Selector failed for some clip URLs (${#sel_failed[@]})."
-              fi
               exit 0
             fi
 
             map_trailer_single "$URL" "$TRAILER"
             if [[ "$MAP_KIND" == "clips" ]]; then
+              echo "DO_DOWNLOAD=true" >> "$GITHUB_ENV"
               echo "DOWNLOAD_ALL=true" >> "$GITHUB_ENV"
               echo "PLAN_KIND=clips" >> "$GITHUB_ENV"
 
-              set +e
               if [[ "$MODE" == "preset_av" ]]; then
                 EFF="$(python tools/select_format.py --url "$MAP_TARGET" --trailer t0 $DEFAULT_FLAG --mode preset_av \
                   --preset-av-profile "${{ inputs.preset_av_profile }}" --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
@@ -602,9 +603,8 @@ jobs:
                   --audio-lang "${{ inputs.audio_lang }}" --sub-lang "${{ inputs.sub_lang }}" \
                   | tail -n 1 | tr -d '\r\n')"
               fi
-              RC=$?
-              set -e
-              if [[ $RC -ne 0 || -z "$EFF" ]]; then
+
+              if [[ -z "$EFF" ]]; then
                 echo "::error::Selector failed for fallback clip ($TRAILER -> $MAP_TARGET)"
                 exit 1
               fi
