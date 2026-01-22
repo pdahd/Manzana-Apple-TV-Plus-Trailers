@@ -23,14 +23,14 @@ from core.tagger import tagFile
 
 from utils import logger, sanitize
 
-# core/control.py @ v2.3.2
-# Changes vs v2.3.1:
-# - Add explicit human-readable logs for each item (trailer/clip) before downloading:
-#     * trailer tag (t0/t1/..)
-#     * title / videoTitle (so Actions logs show "吹替版/字幕版")
-#     * output filename
-# - Keep v2.3.1 output filename collision fixes:
-#     Add [tN] suffix; for clip URLs also add [clip-<id>] suffix.
+# core/control.py @ v2.3.3
+# Changes vs v2.3.2:
+# - Filename safety (artifact/windows-safe) double-guard:
+#     After assembling the full base filename (including [tN] and [clip-...]),
+#     sanitize the WHOLE base_name again to ensure no ":" etc can appear due to
+#     normalization effects or unexpected characters.
+# - Keep v2.3.2 human-readable logs (Preparing..., Output file: ...).
+# - Keep v2.3.1 collision avoidance: [tN] suffix + [clip-<id>] suffix for clip URLs.
 
 
 cons = Console()
@@ -332,7 +332,7 @@ def run(args):
 
             year = str(item.get("releaseDate") or "")[0:4] or "0000"
 
-            base_name = "{} - {} ({}) Trailer [WEB-DL] [ATVP] [{}]".format(
+            base_name_raw = "{} - {} ({}) Trailer [WEB-DL] [ATVP] [{}]".format(
                 sanitize(item.get("title") or ""),
                 sanitize(item.get("videoTitle") or ""),
                 year,
@@ -340,11 +340,16 @@ def run(args):
             )
 
             if clip_suffix:
-                base_name += f" [clip-{sanitize(clip_suffix)}]"
+                base_name_raw += f" [clip-{sanitize(clip_suffix)}]"
+
+            # NEW (v2.3.3): sanitize the FULL name as a final guard (Windows/artifact safe)
+            base_name = sanitize(base_name_raw)
+            if not base_name:
+                base_name = "manzana_output"
 
             op = os.path.join(OUTPUTDIR, base_name + ".mp4")
 
-            # NEW (v2.3.2): explicit human-readable logs
+            # explicit human-readable logs
             logger.info(f'Preparing [{trailer_tag}] {item.get("title","")} | {item.get("videoTitle","")}')
             logger.info(f"Output file: {os.path.basename(op)}")
 
