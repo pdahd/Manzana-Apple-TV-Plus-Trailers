@@ -24,20 +24,17 @@ from core.tagger import tagFile
 
 from utils import logger, sanitize
 
-# core/control.py @ v2.4.0
-# Changes vs v2.3.3:
-# - Final delivery filename policy (user-friendly):
-#     "{MovieTitle} - {VideoTitle (dedup)} ({Year}) Apple-Trailer.mp4"
-#   * Keep year
-#   * Replace [ATVP]/[WEB-DL]/[t0]/[clip-...] with a single, human-readable suffix "Apple-Trailer"
-#     placed immediately before ".mp4".
-# - Deduplicate repeated title prefix in videoTitle:
-#     If videoTitle starts with title, remove that prefix so we don't get:
-#       "X - X Rogue Edition ..."
-# - No more "exists => skip". Instead auto-append (2), (3), ... to avoid overwriting:
-#     "... (2014) Apple-Trailer.mp4"
-#     "... (2014) (2) Apple-Trailer.mp4"
-# - Keep non-interactive / -F behavior unchanged.
+# core/control.py @ v2.4.1
+# Changes vs v2.4.0:
+# - Fix "prefix dedup" misses caused by punctuation/fullwidth variants:
+#   Compare and cut prefix using NFKC-normalized strings + whitespace collapse.
+# - If the remaining suffix starts with parentheses/brackets, join with space instead of " - "
+#   so we get: "Movie (字幕吹替) (2014) Apple-Trailer.mp4" rather than "Movie - (字幕吹替)..."
+# - Keep v2.4.0 policy:
+#   "{MovieTitle} - {VideoTitle (dedup)} ({Year}) Apple-Trailer.mp4"
+#   Apple-Trailer always immediately before ".mp4"
+#   Auto (2)/(3)... on name collision
+#   No [WEB-DL]/[ATVP]/[t0]/[clip-...] in final delivery name
 
 
 cons = Console()
@@ -151,7 +148,6 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
     cons.print(f"\tMaster M3U8: [bold]{master_url}[/]")
     print()
 
-    # Video
     vtable = Table(box=box.ROUNDED)
     vtable.add_column("ID", justify="center")
     vtable.add_column("Codec", justify="left")
@@ -172,7 +168,6 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
             str(v.get("range")),
         )
 
-    # Audio
     atable = Table(box=box.ROUNDED)
     atable.add_column("ID", justify="center")
     atable.add_column("Codec", justify="left")
@@ -193,7 +188,6 @@ def _print_formats(item_meta: dict, master_url: str, indexed: dict, page_url: st
             "YES" if a.get("isAD") else "NO",
         )
 
-    # Subs
     stable = Table(box=box.ROUNDED)
     stable.add_column("ID", justify="center")
     stable.add_column("Language", justify="center")
@@ -282,59 +276,89 @@ def _ensure_tools(selected_tracks: list):
         logger.error('Unable to find "ffmpeg" in PATH! (required for subtitle conversion)', 1)
 
 
+def _norm_for_prefix_compare(s: str) -> str:
+    """
+    Normalize string for prefix comparison:
+    - NFKC to unify fullwidth/halfwidth punctuation (&/＆, ：/:, etc.)
+    - collapse whitespace
+    """
+    s = unicodedata.normalize("NFKC", str(s or "")).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
 def _dedup_video_title_prefix(movie_title: str, video_title: str) -> str:
     """
-    If video_title starts with movie_title, remove that prefix to avoid:
-      "Movie - Movie Something"
-    Conservative: only trims when the raw string startswith match is true.
+    Remove repeated movie title prefix from video title, using NFKC-normalized comparison.
+
+    Example:
+      movie_title="X-MEN：フューチャー&パスト"
+      video_title="X-MEN：フューチャー＆パスト (字幕/吹替)"
+    => returns "(字幕/吹替)"
     """
-    mt = (movie_title or "").strip()
-    vt = (video_title or "").strip()
+    mt_raw = str(movie_title or "").strip()
+    vt_raw = str(video_title or "").strip()
+    if not mt_raw or not vt_raw:
+        return vt_raw
+
+    mt = _norm_for_prefix_compare(mt_raw)
+    vt = _norm_for_prefix_compare(vt_raw)
+
     if not mt or not vt:
-        return vt
+        return vt_raw
 
     if vt.startswith(mt):
         rest = vt[len(mt):].strip()
-        # Remove common separators after prefix
+        # strip common separators after prefix
         rest = rest.lstrip(" -–—:：|・･")
         rest = rest.strip()
         return rest
 
-    return vt
+    return vt_raw
 
 
 def _build_delivery_basename(movie_title: str, video_title: str, year: str) -> str:
     """
     Build user-facing base name WITHOUT extension.
-    Result example:
-      "X-MENフューチャー&パスト - ローグ・エディション (字幕吹替) (2014) Apple-Trailer"
+    Must end with " Apple-Trailer" (immediately before .mp4).
     """
-    mt = sanitize(movie_title or "")
-    vt = sanitize(video_title or "")
 
-    # Dedup prefix (use pre-sanitized originals for correct slicing, but sanitize again later anyway)
-    vt2 = _dedup_video_title_prefix(movie_title or "", video_title or "")
-    vt2 = sanitize(vt2)
-
+    # year normalize
     y = (year or "").strip()
     if not y or not re.match(r"^\d{4}$", y):
         y = "0000"
 
-    # Compose core title part
-    if vt2 and vt2 != mt:
-        core = f"{mt} - {vt2} ({y})"
+    mt_raw = str(movie_title or "").strip()
+    vt_raw = str(video_title or "").strip()
+
+    # Dedup: get a "rest" (may be "(字幕/吹替)" or "ローグ・エディション (字幕/吹替)")
+    rest = _dedup_video_title_prefix(mt_raw, vt_raw)
+    rest = str(rest or "").strip()
+
+    # Decide join style:
+    # - If rest is empty: just movie title
+    # - If rest starts with brackets: join with space (more natural)
+    # - Else: join with " - "
+    mt_disp = mt_raw
+    if not mt_disp:
+        mt_disp = "manzana_output"
+
+    if not rest or _norm_for_prefix_compare(rest) == _norm_for_prefix_compare(mt_disp):
+        core = f"{mt_disp} ({y})"
     else:
-        core = f"{mt} ({y})"
+        if rest[:1] in ("(", "（", "[", "【"):
+            core = f"{mt_disp} {rest} ({y})"
+        else:
+            core = f"{mt_disp} - {rest} ({y})"
 
     core = sanitize(core)
     if not core:
-        core = "manzana_output"
+        core = "manzana_output (0000)"
 
-    # Required suffix right before extension
     base = f"{core} Apple-Trailer"
     base = sanitize(base)
     if not base:
-        base = "manzana_output Apple-Trailer"
+        base = "manzana_output (0000) Apple-Trailer"
 
     return base
 
@@ -342,19 +366,17 @@ def _build_delivery_basename(movie_title: str, video_title: str, year: str) -> s
 def _unique_output_path(base_no_ext: str, out_dir: str) -> str:
     """
     Ensure output filename uniqueness by appending (2), (3)... BEFORE 'Apple-Trailer'.
-    We keep 'Apple-Trailer' immediately before .mp4 as requested.
+    Keep 'Apple-Trailer' immediately before .mp4.
     """
     base_no_ext = sanitize(base_no_ext)
     if not base_no_ext:
-        base_no_ext = "manzana_output Apple-Trailer"
+        base_no_ext = "manzana_output (0000) Apple-Trailer"
 
     suffix = " Apple-Trailer"
-    stem = base_no_ext
-    if stem.endswith(suffix):
-        stem_core = stem[: -len(suffix)].rstrip()
+    if base_no_ext.endswith(suffix):
+        stem_core = base_no_ext[: -len(suffix)].rstrip()
     else:
-        # fallback: treat whole as stem_core
-        stem_core = stem
+        stem_core = base_no_ext
 
     def make(n: int) -> str:
         if n <= 1:
@@ -363,22 +385,20 @@ def _unique_output_path(base_no_ext: str, out_dir: str) -> str:
             bn = f"{stem_core} ({n}){suffix}"
         bn = sanitize(bn)
         if not bn:
-            bn = f"manzana_output ({n}){suffix}"
+            bn = f"manzana_output (0000) ({n}){suffix}"
         return os.path.join(out_dir, bn + ".mp4")
 
-    # Try without numbering first
     p = make(1)
     if not os.path.exists(p):
         return p
 
-    # Then (2), (3)...
     for i in range(2, 1000):
         p2 = make(i)
         if not os.path.exists(p2):
             return p2
 
     logger.error("Unable to find a free output filename (too many duplicates).", 1)
-    return make(9999)  # unreachable
+    return make(9999)
 
 
 def run(args):
@@ -396,7 +416,6 @@ def run(args):
         for ti, item in enumerate(selected_trailers):
             master_url = item["hlsUrl"]
 
-            # list formats mode
             if args.listFormats:
                 logger.info(f'Listing formats for {item.get("title","")} | {item.get("videoTitle","")}')
                 hls = get_hls(master_url)
@@ -412,23 +431,19 @@ def run(args):
                 video_title=str(item.get("videoTitle") or ""),
                 year=year,
             )
-
             op = _unique_output_path(base, OUTPUTDIR)
 
-            # human-readable logs
             logger.info(f'Preparing {item.get("title","")} | {item.get("videoTitle","")}')
             logger.info(f"Output file: {os.path.basename(op)}")
 
             hls = get_hls(master_url)
             indexed = _index_tracks(hls)
 
-            # If -f is provided => non-interactive selection
             if args.format:
                 if args.noAudio or args.noSubs:
                     logger.warning('"-f/--format" provided; ignoring --no-audio/--no-subs')
                 userReq = _select_by_format(args.format, indexed)
             else:
-                # Legacy interactive mode (only if allowed)
                 if args.noPrompt or (not sys.stdin.isatty()):
                     logger.error('Non-interactive mode: please use -F to list formats and -f to select.', 1)
 
