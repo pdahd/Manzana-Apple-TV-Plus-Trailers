@@ -23,13 +23,14 @@ from core.process import appendFiles
 from core.tagger import tagFile
 
 from utils import logger, sanitize
-from utils.bootstrap_tools import ensure_mp4box
+from utils.bootstrap_tools import ensure_mp4box, ensure_ffmpeg
 
-# core/control.py @ v2.4.2
-# Changes vs v2.4.1:
-# - Add runtime bootstrap for MP4Box (GPAC):
-#   - If system MP4Box exists and meets minimal version, use it
-#   - Otherwise auto-download/use our bundled MP4Box (mp4box-bundle-latest)
+# core/control.py @ v2.4.3
+# Changes vs v2.4.2:
+# - Add runtime bootstrap for FFmpeg (BtbN bundle mirror):
+#   - Only when subtitle tracks are selected (sN present)
+#   - If system ffmpeg meets minimal version, use it
+#   - Otherwise auto-download/use our bundled ffmpeg (ffmpeg-bundle-latest)
 # - Keep all existing interactive/non-interactive logic unchanged.
 #
 # Keeps v2.4.1 policy:
@@ -277,13 +278,15 @@ def _select_by_format(expr: str, indexed: dict):
 def _ensure_tools(selected_tracks: list):
     # Ensure MP4Box exists (auto-download bundle if missing/too old)
     ensure_mp4box(min_gpac_version=(2, 0))
-
     if not shutil.which("MP4Box"):
         logger.error('Unable to find "MP4Box" in PATH! (required for muxing)', 1)
 
+    # Ensure ffmpeg ONLY when subtitles are requested
     need_ffmpeg = any(t.get("type") == "subtitle" for t in selected_tracks)
-    if need_ffmpeg and (not shutil.which("ffmpeg")):
-        logger.error('Unable to find "ffmpeg" in PATH! (required for subtitle conversion)', 1)
+    if need_ffmpeg:
+        ensure_ffmpeg(min_ffmpeg_version=(4, 2))
+        if not shutil.which("ffmpeg"):
+            logger.error('Unable to find "ffmpeg" in PATH! (required for subtitle conversion)', 1)
 
 
 def _norm_for_prefix_compare(s: str) -> str:
