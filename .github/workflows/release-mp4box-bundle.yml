@@ -1,21 +1,10 @@
 name: Build & Release MP4Box Bundle
 
-# .github/workflows/release-mp4box-bundle.yml @ v0.1.2
+# .github/workflows/release-mp4box-bundle.yml @ v0.1.3
 #
-# v0.1.2 changes vs v0.1.1:
-# - Fix failure: remove redundant `cp metadata.txt -> same path` (cp complained "same file").
-#
-# What it does:
-# - Build on ubuntu-22.04 via apt (gpac + gpac-modules-base).
-# - Bundle MP4Box + non-glibc shared libs + GPAC modules.
-# - Patch RPATH to prefer bundled libs.
-# - Package as tar.zst + sha256 + metadata.
-# - Test the bundle on ubuntu-22.04 and ubuntu-24.04.
-# - Optionally publish assets to a GitHub Release tag.
-#
-# Notes:
-# - We intentionally exclude glibc/loader libs (libc, ld-linux, libpthread, libm, libdl, librt, libresolv, libutil).
-# - For wider compatibility (e.g. glibc 2.31), move build base to older distro or build from source.
+# v0.1.3 changes vs v0.1.2:
+# - Fix test step failure: $GITHUB_PATH only affects subsequent steps, not current step.
+#   Export PATH inside the same step before calling `command -v MP4Box`.
 
 on:
   workflow_dispatch:
@@ -23,7 +12,7 @@ on:
       tag_name:
         description: "Release tag name (e.g. mp4box-bundle-v2.0.0). Required if publish=true."
         required: false
-        default: "mp4box-bundle-v0.1.2"
+        default: "mp4box-bundle-v0.1.3"
         type: string
       publish:
         description: "Publish to GitHub Release (creates/updates release assets)"
@@ -65,7 +54,6 @@ jobs:
           echo "MP4Box path: $MP4BOX"
 
           GPAC_PKG_VER="$(dpkg-query -W -f='${Version}\n' gpac || true)"
-          # Safe filename token across locales; keep A-Za-z0-9._+- only, replace others with '_'
           GPAC_PKG_VER_SAFE="$(printf '%s' "$GPAC_PKG_VER" | LC_ALL=C sed 's/[^A-Za-z0-9._+\-]/_/g')"
 
           GLIBC_VER="$(ldd --version 2>/dev/null | head -n 1 | awk '{print $NF}')"
@@ -103,7 +91,6 @@ jobs:
             base="$(basename "$p")"
 
             if should_exclude "$base"; then
-              # Skip glibc/loader family libs
               return 0
             fi
 
@@ -148,7 +135,6 @@ jobs:
             exit 1
           fi
 
-          # Bundle GPAC modules directory into $LIB/gpac
           MOD_SRC=""
           for d in /usr/lib/*/gpac /usr/lib/*/gpac/modules; do
             [[ -d "$d" ]] && { MOD_SRC="$d"; break; }
@@ -165,10 +151,8 @@ jobs:
             echo "::warning::Could not locate GPAC modules directory to bundle."
           fi
 
-          # Patch RPATH so MP4Box.bin can find bundled libs without LD_LIBRARY_PATH
           patchelf --set-rpath '$ORIGIN/../lib' "$BIN/MP4Box.bin" || true
 
-          # Wrapper (kept for safety; also sets LD_LIBRARY_PATH)
           cat > "$BIN/MP4Box" <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -178,7 +162,6 @@ jobs:
           SH
           chmod +x "$BIN/MP4Box"
 
-          # Metadata (already in $RUNNER_TEMP, no need to copy)
           META="$RUNNER_TEMP/metadata.txt"
           {
             echo "bundle_rev=${{ inputs.bundle_rev }}"
@@ -198,7 +181,6 @@ jobs:
           ls -la "$LIB/gpac" 2>/dev/null | head -n 120 || true
           echo "::endgroup::"
 
-          # Package
           ASSET_BASENAME="mp4box-gpac_${GPAC_PKG_VER_SAFE}-linux_${ARCH}-ubuntu${UBUNTU_VER}-glibc${GLIBC_VER}-rev${{ inputs.bundle_rev }}"
           ASSET_FILE="${ASSET_BASENAME}.tar.zst"
           SHA_FILE="${ASSET_FILE}.sha256"
@@ -206,7 +188,6 @@ jobs:
           tar --zstd -cf "$RUNNER_TEMP/$ASSET_FILE" -C "$BUNDLE_ROOT" .
           (cd "$RUNNER_TEMP" && sha256sum "$ASSET_FILE" > "$SHA_FILE")
 
-          # Export outputs
           echo "asset_basename=$ASSET_BASENAME" >> "$GITHUB_OUTPUT"
           echo "asset_file=$ASSET_FILE" >> "$GITHUB_OUTPUT"
           echo "sha_file=$SHA_FILE" >> "$GITHUB_OUTPUT"
@@ -246,17 +227,24 @@ jobs:
           ls -la
           sha256sum -c "${{ needs.build.outputs.sha_file }}"
 
-          mkdir -p "$HOME/.local/mp4box-bundle"
-          tar --zstd -xf "${{ needs.build.outputs.asset_file }}" -C "$HOME/.local/mp4box-bundle"
+          BUNDLE="$HOME/.local/mp4box-bundle"
+          rm -rf "$BUNDLE"
+          mkdir -p "$BUNDLE"
 
-          echo "$HOME/.local/mp4box-bundle/bin" >> "$GITHUB_PATH"
-          export LD_LIBRARY_PATH="$HOME/.local/mp4box-bundle/lib:${LD_LIBRARY_PATH:-}"
+          tar --zstd -xf "${{ needs.build.outputs.asset_file }}" -C "$BUNDLE"
+
+          # IMPORTANT: $GITHUB_PATH affects subsequent steps only.
+          # Export PATH for THIS step.
+          export PATH="$BUNDLE/bin:$PATH"
+          echo "$BUNDLE/bin" >> "$GITHUB_PATH"
+
+          export LD_LIBRARY_PATH="$BUNDLE/lib:${LD_LIBRARY_PATH:-}"
 
           command -v MP4Box
           MP4Box -version | head -n 3
 
           echo "::group::ldd MP4Box.bin (realistic env)"
-          ldd "$HOME/.local/mp4box-bundle/bin/MP4Box.bin" | tee /tmp/ldd-mp4box.txt
+          ldd "$BUNDLE/bin/MP4Box.bin" | tee /tmp/ldd-mp4box.txt
           echo "::endgroup::"
           ! grep -q "not found" /tmp/ldd-mp4box.txt
 
