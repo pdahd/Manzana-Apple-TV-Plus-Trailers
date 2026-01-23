@@ -23,9 +23,16 @@ from core.process import appendFiles
 from core.tagger import tagFile
 
 from utils import logger, sanitize
+from utils.bootstrap_tools import ensure_mp4box
 
-# core/control.py @ v2.4.1
-# Changes vs v2.4.0:
+# core/control.py @ v2.4.2
+# Changes vs v2.4.1:
+# - Add runtime bootstrap for MP4Box (GPAC):
+#   - If system MP4Box exists and meets minimal version, use it
+#   - Otherwise auto-download/use our bundled MP4Box (mp4box-bundle-latest)
+# - Keep all existing interactive/non-interactive logic unchanged.
+#
+# Keeps v2.4.1 policy:
 # - Fix "prefix dedup" misses caused by punctuation/fullwidth variants:
 #   Compare and cut prefix using NFKC-normalized strings + whitespace collapse.
 # - If the remaining suffix starts with parentheses/brackets, join with space instead of " - "
@@ -268,6 +275,9 @@ def _select_by_format(expr: str, indexed: dict):
 
 
 def _ensure_tools(selected_tracks: list):
+    # Ensure MP4Box exists (auto-download bundle if missing/too old)
+    ensure_mp4box(min_gpac_version=(2, 0))
+
     if not shutil.which("MP4Box"):
         logger.error('Unable to find "MP4Box" in PATH! (required for muxing)', 1)
 
