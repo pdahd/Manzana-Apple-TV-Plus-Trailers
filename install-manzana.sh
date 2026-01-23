@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# install-manzana.sh @ v0.1.0
+# install-manzana.sh @ v0.1.1
+#
+# Changes vs v0.1.0:
+# - Fix venv creation failure on environments where ensurepip is missing/disabled (e.g. some Colab images):
+#   - Try normal: python3 -m venv <venv>
+#   - If it fails, retry: python3 -m venv --without-pip <venv>
+#   - Then bootstrap pip inside venv via get-pip.py (no sudo).
 #
 # Purpose:
 # - One-liner installer for Manzana on Linux (user-space, no sudo).
@@ -10,14 +16,6 @@ set -euo pipefail
 # Default install locations:
 # - APP_DIR:  ~/.local/share/manzana
 # - BIN_DIR:  ~/.local/bin
-#
-# Requirements:
-# - python3 (with venv module)
-# - curl (or wget)
-#
-# Notes:
-# - This script does NOT install ffmpeg/MP4Box system-wide.
-#   Manzana runtime can auto-bootstrap bundled ffmpeg/mp4box if missing/too old.
 
 REPO_OWNER="pdahd"
 REPO_NAME="Manzana-Apple-TV-Plus-Trailers"
@@ -45,9 +43,6 @@ say "Bin dir:     $BIN_DIR"
 say ""
 
 need_cmd python3
-if ! python3 -c 'import venv' >/dev/null 2>&1; then
-  die "python3 venv module not available. On Debian/Ubuntu: sudo apt-get install -y python3-venv"
-fi
 
 if command -v curl >/dev/null 2>&1; then
   DL="curl -fsSL"
@@ -73,17 +68,36 @@ SRC_DIR="$(find "$TMP/src" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -n 
 
 say "Installing files..."
 mkdir -p "$APP_DIR"
-# Replace app dir contents (safe update behavior)
-rm -rf "$APP_DIR"/.git 2>/dev/null || true
-# Keep user venv if exists? We rebuild venv to keep dependencies consistent.
-rm -rf "$APP_DIR"/venv 2>/dev/null || true
-# Sync source
-rm -rf "$APP_DIR"/src 2>/dev/null || true
+# Rebuild venv each time to keep dependencies consistent
+rm -rf "$APP_DIR/venv" 2>/dev/null || true
+rm -rf "$APP_DIR/src" 2>/dev/null || true
 mkdir -p "$APP_DIR/src"
 cp -a "$SRC_DIR"/. "$APP_DIR/src/"
 
 say "Creating virtualenv..."
+set +e
 python3 -m venv "$APP_DIR/venv"
+VENV_RC=$?
+set -e
+
+if [[ $VENV_RC -ne 0 ]]; then
+  say "WARN: python3 -m venv failed (ensurepip may be missing/disabled). Retrying with --without-pip + get-pip.py..."
+  rm -rf "$APP_DIR/venv" 2>/dev/null || true
+
+  python3 -m venv --without-pip "$APP_DIR/venv"
+
+  # Bootstrap pip inside venv (no sudo)
+  say "Bootstrapping pip via get-pip.py..."
+  GETPIP_URL="https://bootstrap.pypa.io/get-pip.py"
+  $DL "$GETPIP_URL" > "$TMP/get-pip.py"
+
+  "$APP_DIR/venv/bin/python" "$TMP/get-pip.py" >/dev/null
+fi
+
+# Sanity check
+if [[ ! -x "$APP_DIR/venv/bin/python" ]]; then
+  die "venv python not found: $APP_DIR/venv/bin/python"
+fi
 
 say "Installing python deps..."
 "$APP_DIR/venv/bin/python" -m pip install --upgrade pip >/dev/null
