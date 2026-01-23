@@ -117,7 +117,7 @@ on:
 
 jobs:
   download:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
 
     steps:
@@ -671,13 +671,142 @@ jobs:
           command -v ffprobe
           ffprobe -version | head -n 3
 
-      - name: Install MP4Box (gpac) [Phase 2 only]
+      # ===== MP4Box (gpac) bundle steps START (MP4Box 专用步骤开始；与其它步骤逻辑无关) =====
+
+      - name: Detect Ubuntu VERSION_ID (for stable gpac cache key) [Phase 2 only]
         if: ${{ env.DO_DOWNLOAD == 'true' }}
         run: |
+          set -euo pipefail
+          . /etc/os-release
+          echo "UBUNTU_VERSION_ID=$VERSION_ID" >> "$GITHUB_ENV"
+          echo "Detected UBUNTU_VERSION_ID=$VERSION_ID"
+
+      - name: Cache MP4Box bundle (gpac) [Phase 2 only]
+        if: ${{ env.DO_DOWNLOAD == 'true' }}
+        id: cache-gpac
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/gpac-bundle
+          key: gpac-bundle-${{ runner.os }}-ubuntu${{ env.UBUNTU_VERSION_ID }}-${{ runner.arch }}-rev2
+
+      - name: Verify cached MP4Box bundle (self-heal marker) [Phase 2 only]
+        if: ${{ env.DO_DOWNLOAD == 'true' }}
+        id: verify-gpac
+        run: |
+          set -euo pipefail
+          BUNDLE="$HOME/.local/gpac-bundle"
+          if [[ -x "$BUNDLE/bin/MP4Box" && -x "$BUNDLE/bin/MP4Box.bin" ]]; then
+            export PATH="$BUNDLE/bin:$PATH"
+            if MP4Box -version >/dev/null 2>&1; then
+              echo "ok=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+
+      - name: Build gpac bundle on miss or broken cache (apt + ldd + gpac modules) [Phase 2 only]
+        if: ${{ env.DO_DOWNLOAD == 'true' && (steps.cache-gpac.outputs.cache-hit != 'true' || steps.verify-gpac.outputs.ok != 'true') }}
+        run: |
+          set -euo pipefail
+
+          # If cache-hit but bundle is broken, rebuild cleanly to avoid mixed files.
+          rm -rf "$HOME/.local/gpac-bundle"
+
           sudo apt-get update
           sudo apt-get install -y gpac
+
+          MP4BOX_PATH="$(command -v MP4Box)"
+          echo "MP4Box path: $MP4BOX_PATH"
+
+          BUNDLE="$HOME/.local/gpac-bundle"
+          BIN="$BUNDLE/bin"
+          LIB="$BUNDLE/lib"
+          mkdir -p "$BIN" "$LIB"
+
+          cp -av "$MP4BOX_PATH" "$BIN/MP4Box.bin"
+
+          copy_lib() {
+            local p="$1"
+            [[ -z "$p" ]] && return 0
+            [[ ! -e "$p" ]] && return 1
+
+            local base real real_base
+            base="$(basename "$p")"
+            real="$(readlink -f "$p" || true)"
+            [[ -z "$real" || ! -e "$real" ]] && real="$p"
+            real_base="$(basename "$real")"
+
+            [[ ! -e "$LIB/$real_base" ]] && cp -av "$real" "$LIB/"
+            [[ "$base" != "$real_base" ]] && ln -sf "$real_base" "$LIB/$base"
+          }
+
+          missing=0
+          while IFS= read -r line; do
+            if echo "$line" | grep -q "not found"; then
+              echo "::error::Missing dependency: $line"
+              missing=1
+              continue
+            fi
+
+            p="$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) {print $i; exit}}')"
+            [[ -z "$p" ]] && continue
+            echo "$p" | grep -q "linux-vdso" && continue
+
+            copy_lib "$p" || missing=1
+          done < <(ldd "$BIN/MP4Box.bin" || true)
+
+          if [[ "$missing" -ne 0 ]]; then
+            echo "::error::Some dependencies were missing/unpackable."
+            exit 1
+          fi
+
+          # Bundle GPAC modules directory into $LIB/gpac
+          MOD_SRC=""
+          for d in /usr/lib/*/gpac /usr/lib/*/gpac/modules; do
+            [[ -d "$d" ]] && { MOD_SRC="$d"; break; }
+          done
+          if [[ -z "$MOD_SRC" ]]; then
+            MOD_SRC="$(dpkg -L gpac 2>/dev/null | grep -E '/gpac(/modules)?$' | head -n 1 || true)"
+          fi
+          if [[ -n "$MOD_SRC" && -d "$MOD_SRC" ]]; then
+            mkdir -p "$LIB/gpac"
+            cp -a "$MOD_SRC"/. "$LIB/gpac/" || true
+          else
+            echo "::warning::Could not locate GPAC modules directory to bundle (may affect plugin-based features)."
+          fi
+
+          # Wrapper to set LD_LIBRARY_PATH for bundled libs
+          cat > "$BIN/MP4Box" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="$DIR/../lib:${LD_LIBRARY_PATH:-}"
+          exec "$DIR/MP4Box.bin" "$@"
+          SH
+          chmod +x "$BIN/MP4Box"
+
+      - name: Use MP4Box bundle (cache hit => no apt install) [Phase 2 only]
+        if: ${{ env.DO_DOWNLOAD == 'true' }}
+        run: |
+          set -euo pipefail
+          BUNDLE_BIN="$HOME/.local/gpac-bundle/bin"
+          export PATH="$BUNDLE_BIN:$PATH"
+          echo "$BUNDLE_BIN" >> "$GITHUB_PATH"
           command -v MP4Box
           MP4Box -version || true
+
+      - name: Quick runtime check (ldd + run) - realistic env [Phase 2 only]
+        if: ${{ env.DO_DOWNLOAD == 'true' }}
+        run: |
+          set -euo pipefail
+
+          BUNDLE="$HOME/.local/gpac-bundle"
+          export LD_LIBRARY_PATH="$BUNDLE/lib:${LD_LIBRARY_PATH:-}"
+
+          ldd "$BUNDLE/bin/MP4Box.bin" | tee /tmp/ldd-mp4box.txt
+          ! grep -q "not found" /tmp/ldd-mp4box.txt
+
+      # ===== MP4Box (gpac) bundle steps END (MP4Box 专用步骤结束；与其它步骤逻辑无关) =====
 
       - name: Phase 2 - Download (custom single / custom all / preset single / preset all + clip fallback) [grouped]
         if: ${{ env.DO_DOWNLOAD == 'true' }}
