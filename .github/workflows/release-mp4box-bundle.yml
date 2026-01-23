@@ -1,15 +1,16 @@
 name: Build & Release MP4Box Bundle
 
-# .github/workflows/release-mp4box-bundle.yml @ v0.1.5
+# .github/workflows/release-mp4box-bundle.yml @ v0.1.6
 #
-# v0.1.5 changes vs v0.1.4:
-# - When publish=true:
-#   1) Publish a versioned release to tag_name (assets keep versioned filenames)
-#   2) ALSO publish/update a stable "latest" release/tag: mp4box-bundle-latest
-#      with FIXED asset names for permanent download URLs:
-#        - mp4box-bundle-linux-x86_64.tar.zst
-#        - mp4box-bundle-linux-x86_64.tar.zst.sha256
-#        - metadata.txt
+# v0.1.6 changes vs v0.1.5:
+# - Add a gzip archive for broader end-user compatibility (no tar --zstd / no zstd requirement):
+#   When publish=true, the "latest" release will now include BOTH:
+#     - mp4box-bundle-linux-x86_64.tar.zst (+ .sha256)
+#     - mp4box-bundle-linux-x86_64.tar.gz  (+ .sha256)   <-- new
+#   metadata.txt is still uploaded.
+#
+# - Also produce and upload a versioned .tar.gz (+ .sha256) alongside the versioned .tar.zst (+ .sha256)
+#   for convenience/inspection (optional but useful).
 #
 # Notes:
 # - Build base: ubuntu-22.04 (glibc 2.35). Bundle is tested on ubuntu-22.04 and ubuntu-24.04.
@@ -20,9 +21,9 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Versioned release tag name (e.g. mp4box-bundle-v0.1.5-rev1). Required if publish=true."
+        description: "Versioned release tag name (e.g. mp4box-bundle-v0.1.6-rev1). Required if publish=true."
         required: false
-        default: "mp4box-bundle-v0.1.5-rev1"
+        default: "mp4box-bundle-v0.1.6-rev1"
         type: string
       publish:
         description: "Publish to GitHub Release (creates/updates release assets). Also updates mp4box-bundle-latest."
@@ -44,8 +45,10 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       asset_basename: ${{ steps.meta.outputs.asset_basename }}
-      asset_file: ${{ steps.meta.outputs.asset_file }}
-      sha_file: ${{ steps.meta.outputs.sha_file }}
+      asset_zst: ${{ steps.meta.outputs.asset_zst }}
+      sha_zst: ${{ steps.meta.outputs.sha_zst }}
+      asset_gz: ${{ steps.meta.outputs.asset_gz }}
+      sha_gz: ${{ steps.meta.outputs.sha_gz }}
       meta_file: ${{ steps.meta.outputs.meta_file }}
 
     steps:
@@ -186,26 +189,37 @@ jobs:
             echo "build_time_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           } > "$META"
 
-          # Package (versioned filename)
+          # Versioned base name
           ASSET_BASENAME="mp4box-gpac_${GPAC_PKG_VER_SAFE}-linux_${ARCH}-ubuntu${UBUNTU_VER}-glibc${GLIBC_VER}-rev${{ inputs.bundle_rev }}"
-          ASSET_FILE="${ASSET_BASENAME}.tar.zst"
-          SHA_FILE="${ASSET_FILE}.sha256"
 
-          tar --zstd -cf "$RUNNER_TEMP/$ASSET_FILE" -C "$BUNDLE_ROOT" .
-          (cd "$RUNNER_TEMP" && sha256sum "$ASSET_FILE" > "$SHA_FILE")
+          # Versioned tar.zst
+          ASSET_ZST="${ASSET_BASENAME}.tar.zst"
+          SHA_ZST="${ASSET_ZST}.sha256"
+          tar --zstd -cf "$RUNNER_TEMP/$ASSET_ZST" -C "$BUNDLE_ROOT" .
+          (cd "$RUNNER_TEMP" && sha256sum "$ASSET_ZST" > "$SHA_ZST")
+
+          # Versioned tar.gz (new)
+          ASSET_GZ="${ASSET_BASENAME}.tar.gz"
+          SHA_GZ="${ASSET_GZ}.sha256"
+          tar -czf "$RUNNER_TEMP/$ASSET_GZ" -C "$BUNDLE_ROOT" .
+          (cd "$RUNNER_TEMP" && sha256sum "$ASSET_GZ" > "$SHA_GZ")
 
           echo "asset_basename=$ASSET_BASENAME" >> "$GITHUB_OUTPUT"
-          echo "asset_file=$ASSET_FILE" >> "$GITHUB_OUTPUT"
-          echo "sha_file=$SHA_FILE" >> "$GITHUB_OUTPUT"
+          echo "asset_zst=$ASSET_ZST" >> "$GITHUB_OUTPUT"
+          echo "sha_zst=$SHA_ZST" >> "$GITHUB_OUTPUT"
+          echo "asset_gz=$ASSET_GZ" >> "$GITHUB_OUTPUT"
+          echo "sha_gz=$SHA_GZ" >> "$GITHUB_OUTPUT"
           echo "meta_file=$(basename "$META")" >> "$GITHUB_OUTPUT"
 
-      - name: Upload build artifacts (tar.zst + sha256 + metadata)
+      - name: Upload build artifacts (archives + sha256 + metadata)
         uses: actions/upload-artifact@v4
         with:
           name: mp4box-bundle-build
           path: |
-            ${{ runner.temp }}/${{ steps.meta.outputs.asset_file }}
-            ${{ runner.temp }}/${{ steps.meta.outputs.sha_file }}
+            ${{ runner.temp }}/${{ steps.meta.outputs.asset_zst }}
+            ${{ runner.temp }}/${{ steps.meta.outputs.sha_zst }}
+            ${{ runner.temp }}/${{ steps.meta.outputs.asset_gz }}
+            ${{ runner.temp }}/${{ steps.meta.outputs.sha_gz }}
             ${{ runner.temp }}/${{ steps.meta.outputs.meta_file }}
           if-no-files-found: error
 
@@ -225,19 +239,19 @@ jobs:
           name: mp4box-bundle-build
           path: ${{ runner.temp }}/mp4box-bundle-build
 
-      - name: Extract + run checks
+      - name: Extract + run checks (tar.gz)
         run: |
           set -euo pipefail
           cd "${{ runner.temp }}/mp4box-bundle-build"
 
           ls -la
-          sha256sum -c "${{ needs.build.outputs.sha_file }}"
+          sha256sum -c "${{ needs.build.outputs.sha_gz }}"
 
           BUNDLE="$HOME/.local/mp4box-bundle"
           rm -rf "$BUNDLE"
           mkdir -p "$BUNDLE"
 
-          tar --zstd -xf "${{ needs.build.outputs.asset_file }}" -C "$BUNDLE"
+          tar -xzf "${{ needs.build.outputs.asset_gz }}" -C "$BUNDLE"
 
           export PATH="$BUNDLE/bin:$PATH"
           echo "$BUNDLE/bin" >> "$GITHUB_PATH"
@@ -281,23 +295,29 @@ jobs:
 
           TAG_LATEST="mp4box-bundle-latest"
 
-          ASSET_VER="${{ needs.build.outputs.asset_file }}"
-          SHA_VER="${{ needs.build.outputs.sha_file }}"
+          # Versioned assets from build job
+          ASSET_ZST="${{ needs.build.outputs.asset_zst }}"
+          SHA_ZST="${{ needs.build.outputs.sha_zst }}"
+          ASSET_GZ="${{ needs.build.outputs.asset_gz }}"
+          SHA_GZ="${{ needs.build.outputs.sha_gz }}"
           META="metadata.txt"
 
-          # Prepare FIXED filenames for stable latest URLs
-          FIX_ASSET="mp4box-bundle-linux-x86_64.tar.zst"
-          FIX_SHA="${FIX_ASSET}.sha256"
+          # Fixed names for latest (stable URLs)
+          FIX_ZST="mp4box-bundle-linux-x86_64.tar.zst"
+          FIX_ZST_SHA="${FIX_ZST}.sha256"
+          FIX_GZ="mp4box-bundle-linux-x86_64.tar.gz"
+          FIX_GZ_SHA="${FIX_GZ}.sha256"
 
-          cp -f "$ASSET_VER" "$FIX_ASSET"
-          sha256sum "$FIX_ASSET" > "$FIX_SHA"
+          cp -f "$ASSET_ZST" "$FIX_ZST"
+          sha256sum "$FIX_ZST" > "$FIX_ZST_SHA"
+
+          cp -f "$ASSET_GZ" "$FIX_GZ"
+          sha256sum "$FIX_GZ" > "$FIX_GZ_SHA"
 
           make_notes() {
             local out="$1"
             local kind="$2"
             local tag="$3"
-            local asset1="$4"
-            local asset2="$5"
             {
               echo "MP4Box (GPAC) bundle build."
               echo ""
@@ -305,8 +325,10 @@ jobs:
               echo "Tag: $tag"
               echo ""
               echo "Assets:"
-              echo "- $asset1"
-              echo "- $asset2"
+              echo "- (zst) ${4:-}"
+              echo "- (zst sha) ${5:-}"
+              echo "- (gz) ${6:-}"
+              echo "- (gz sha) ${7:-}"
               echo "- $META"
               echo ""
               echo "Notes:"
@@ -328,24 +350,24 @@ jobs:
             fi
           }
 
-          # --- Versioned release (immutable-ish assets) ---
+          # --- Versioned release ---
           NOTES_VER="${{ runner.temp }}/release-notes-versioned.txt"
-          make_notes "$NOTES_VER" "versioned" "$TAG_VER" "$ASSET_VER" "$SHA_VER"
+          make_notes "$NOTES_VER" "versioned" "$TAG_VER" "$ASSET_ZST" "$SHA_ZST" "$ASSET_GZ" "$SHA_GZ"
           ensure_release "$TAG_VER" "MP4Box Bundle (${TAG_VER})" "$NOTES_VER"
 
           gh release upload "$TAG_VER" --repo "$GH_REPO" \
-            "$ASSET_VER" \
-            "$SHA_VER" \
+            "$ASSET_ZST" "$SHA_ZST" \
+            "$ASSET_GZ" "$SHA_GZ" \
             "$META" \
             --clobber
 
-          # --- Latest release (stable URLs + fixed names) ---
+          # --- Latest release (stable URLs) ---
           NOTES_LATEST="${{ runner.temp }}/release-notes-latest.txt"
-          make_notes "$NOTES_LATEST" "latest (stable URLs)" "$TAG_LATEST" "$FIX_ASSET" "$FIX_SHA"
+          make_notes "$NOTES_LATEST" "latest (stable URLs)" "$TAG_LATEST" "$FIX_ZST" "$FIX_ZST_SHA" "$FIX_GZ" "$FIX_GZ_SHA"
           ensure_release "$TAG_LATEST" "MP4Box Bundle (latest)" "$NOTES_LATEST"
 
           gh release upload "$TAG_LATEST" --repo "$GH_REPO" \
-            "$FIX_ASSET" \
-            "$FIX_SHA" \
+            "$FIX_ZST" "$FIX_ZST_SHA" \
+            "$FIX_GZ" "$FIX_GZ_SHA" \
             "$META" \
             --clobber
