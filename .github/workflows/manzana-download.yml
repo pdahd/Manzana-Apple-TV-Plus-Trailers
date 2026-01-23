@@ -1,10 +1,10 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.6.11
-# Changes vs v1.6.10:
-# - Runner: pin to ubuntu-22.04 for stability.
-# - Phase 2: replace apt gpac install with MP4Box(gpac) bundle cache steps (START/END marked).
-# - Fix: copy_lib() return code bug that could falsely mark missing deps.
+# .github/workflows/manzana-download.yml @ v1.6.12
+# Changes vs v1.6.11:
+# - workflow_dispatch: add input gpac_bundle_rev to bump MP4Box(gpac) bundle cache revision (force rebuild).
+# - MP4Box cache key: use rev${{ inputs.gpac_bundle_rev }} instead of hardcoded rev2.
+# - No other changes.
 
 on:
   workflow_dispatch:
@@ -113,6 +113,12 @@ on:
         description: "🧩 仅 mode=custom 生效：留空=只列格式不下载；填写如 v0+a2+s1（必须且只能包含 1 个 vN）。"
         required: false
         default: ""
+        type: string
+
+      gpac_bundle_rev:
+        description: "🔁 MP4Box(gpac) Bundle cache revision（bump 以强制重建缓存），例如 1/2/3。"
+        required: false
+        default: "2"
         type: string
 
 jobs:
@@ -687,7 +693,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.local/gpac-bundle
-          key: gpac-bundle-${{ runner.os }}-ubuntu${{ env.UBUNTU_VERSION_ID }}-${{ runner.arch }}-rev2
+          key: gpac-bundle-${{ runner.os }}-ubuntu${{ env.UBUNTU_VERSION_ID }}-${{ runner.arch }}-rev${{ inputs.gpac_bundle_rev }}
 
       - name: Verify cached MP4Box bundle (self-heal marker) [Phase 2 only]
         if: ${{ env.DO_DOWNLOAD == 'true' }}
