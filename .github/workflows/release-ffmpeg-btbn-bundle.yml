@@ -1,0 +1,294 @@
+name: Build & Release FFmpeg Bundle (BtbN)
+
+# .github/workflows/release-ffmpeg-btbn-bundle.yml @ v0.1.0
+#
+# Purpose:
+# - Mirror BtbN FFmpeg builds into THIS repo releases with stable URLs + sha256.
+# - Provide both versioned release tag and stable "latest" tag:
+#     - Versioned tag: user-provided tag_name
+#     - Latest tag: ffmpeg-bundle-latest
+#
+# Assets:
+# - Versioned:
+#     - ffmpeg-btbn_<ffmpegVersion>-linux_x86_64-revN.tar.gz
+#     - ... .sha256
+#     - metadata.txt
+# - Latest (stable URLs, fixed names):
+#     - ffmpeg-bundle-linux-x86_64.tar.gz
+#     - ffmpeg-bundle-linux-x86_64.tar.gz.sha256
+#     - metadata.txt
+#
+# Notes:
+# - Source: https://github.com/BtbN/FFmpeg-Builds/releases/latest
+# - We package as .tar.gz so end users don't need zstd.
+# - We test extraction + ffmpeg/ffprobe on ubuntu-22.04 and ubuntu-24.04 before publishing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Versioned release tag (e.g. ffmpeg-bundle-v0.1.0-rev1). Required if publish=true."
+        required: false
+        default: "ffmpeg-bundle-v0.1.0-rev1"
+        type: string
+      publish:
+        description: "Publish to GitHub Release (also updates ffmpeg-bundle-latest)"
+        required: true
+        default: false
+        type: boolean
+      bundle_rev:
+        description: "Bundle revision label (for filename/metadata only), e.g. 1/2/3"
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-bundle
+    runs-on: ubuntu-22.04
+    outputs:
+      asset_gz: ${{ steps.meta.outputs.asset_gz }}
+      sha_gz: ${{ steps.meta.outputs.sha_gz }}
+      meta_file: ${{ steps.meta.outputs.meta_file }}
+
+    steps:
+      - name: Download BtbN FFmpeg tar.xz
+        run: |
+          set -euo pipefail
+
+          URL="https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz"
+          echo "Downloading: $URL"
+
+          mkdir -p "$RUNNER_TEMP/in"
+          curl -L --fail --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/in/ffmpeg-btbn.tar.xz" "$URL"
+          ls -la "$RUNNER_TEMP/in"
+
+      - name: Extract + repackage as tar.gz (bundle)
+        id: meta
+        run: |
+          set -euo pipefail
+
+          IN="$RUNNER_TEMP/in/ffmpeg-btbn.tar.xz"
+          WORK="$RUNNER_TEMP/work"
+          OUTROOT="$RUNNER_TEMP/ffmpeg-bundle"
+          rm -rf "$WORK" "$OUTROOT"
+          mkdir -p "$WORK" "$OUTROOT"
+
+          # Extract the upstream tar.xz (it contains a top-level folder)
+          tar -xf "$IN" -C "$WORK"
+
+          # Find extracted top-level dir (e.g. ffmpeg-master-latest-linux64-gpl)
+          TOP="$(find "$WORK" -maxdepth 1 -type d -name "ffmpeg-*" | head -n 1 || true)"
+          if [[ -z "$TOP" || ! -d "$TOP" ]]; then
+            echo "::error::Unable to locate extracted ffmpeg directory under $WORK"
+            ls -la "$WORK" || true
+            exit 1
+          fi
+
+          # Copy ALL contents to our bundle root (bin/lib/share/etc.)
+          cp -a "$TOP"/. "$OUTROOT/"
+
+          # Sanity check: must have ffmpeg/ffprobe
+          if [[ ! -x "$OUTROOT/bin/ffmpeg" ]]; then
+            echo "::error::Missing $OUTROOT/bin/ffmpeg"
+            ls -la "$OUTROOT/bin" || true
+            exit 1
+          fi
+          if [[ ! -x "$OUTROOT/bin/ffprobe" ]]; then
+            echo "::error::Missing $OUTROOT/bin/ffprobe"
+            ls -la "$OUTROOT/bin" || true
+            exit 1
+          fi
+
+          # Get version string
+          FFVER_LINE="$("$OUTROOT/bin/ffmpeg" -version | head -n 1 || true)"
+          echo "ffmpeg version line: $FFVER_LINE"
+
+          # Extract a safe token for filenames (keep A-Za-z0-9._+- only)
+          FFVER_TOKEN="$(printf '%s' "$FFVER_LINE" | LC_ALL=C sed -E 's/^ffmpeg version ([^ ]+).*/\1/; s/[^A-Za-z0-9._+\-]/_/g')"
+          if [[ -z "$FFVER_TOKEN" || "$FFVER_TOKEN" == "$FFVER_LINE" ]]; then
+            # fallback if parsing failed
+            FFVER_TOKEN="unknown"
+          fi
+
+          ARCH="$(uname -m)"
+          UBUNTU_VER="$(. /etc/os-release && echo "$VERSION_ID")"
+          BUILD_UTC="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          # Metadata
+          META="$RUNNER_TEMP/metadata.txt"
+          {
+            echo "bundle_rev=${{ inputs.bundle_rev }}"
+            echo "source=btbn"
+            echo "source_url=https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz"
+            echo "build_ubuntu=${UBUNTU_VER}"
+            echo "arch=${ARCH}"
+            echo "ffmpeg_version_line=${FFVER_LINE}"
+            echo "build_time_utc=${BUILD_UTC}"
+          } > "$META"
+
+          # Package (versioned)
+          ASSET_BASENAME="ffmpeg-btbn_${FFVER_TOKEN}-linux_${ARCH}-rev${{ inputs.bundle_rev }}"
+          ASSET_GZ="${ASSET_BASENAME}.tar.gz"
+          SHA_GZ="${ASSET_GZ}.sha256"
+
+          tar -czf "$RUNNER_TEMP/$ASSET_GZ" -C "$OUTROOT" .
+          (cd "$RUNNER_TEMP" && sha256sum "$ASSET_GZ" > "$SHA_GZ")
+
+          echo "asset_gz=$ASSET_GZ" >> "$GITHUB_OUTPUT"
+          echo "sha_gz=$SHA_GZ" >> "$GITHUB_OUTPUT"
+          echo "meta_file=$(basename "$META")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts (tar.gz + sha256 + metadata)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-bundle-build
+          path: |
+            ${{ runner.temp }}/${{ steps.meta.outputs.asset_gz }}
+            ${{ runner.temp }}/${{ steps.meta.outputs.sha_gz }}
+            ${{ runner.temp }}/${{ steps.meta.outputs.meta_file }}
+          if-no-files-found: error
+
+  test:
+    name: test-bundle-${{ matrix.os }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-bundle-build
+          path: ${{ runner.temp }}/ffmpeg-bundle-build
+
+      - name: Extract + run checks (tar.gz)
+        run: |
+          set -euo pipefail
+          cd "${{ runner.temp }}/ffmpeg-bundle-build"
+
+          ls -la
+          sha256sum -c "${{ needs.build.outputs.sha_gz }}"
+
+          BUNDLE="$HOME/.local/ffmpeg-bundle"
+          rm -rf "$BUNDLE"
+          mkdir -p "$BUNDLE"
+
+          tar -xzf "${{ needs.build.outputs.asset_gz }}" -C "$BUNDLE"
+
+          export PATH="$BUNDLE/bin:$PATH"
+          echo "$BUNDLE/bin" >> "$GITHUB_PATH"
+
+          command -v ffmpeg
+          ffmpeg -version | head -n 2
+          command -v ffprobe
+          ffprobe -version | head -n 2
+
+          echo "::group::ldd ffmpeg (optional)"
+          ldd "$(command -v ffmpeg)" || true
+          echo "::endgroup::"
+
+  release:
+    name: release
+    needs: [build, test]
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-bundle-build
+          path: ${{ runner.temp }}/ffmpeg-bundle-build
+
+      - name: Create/Update GitHub Releases (versioned + latest) and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd "${{ runner.temp }}/ffmpeg-bundle-build"
+
+          TAG_VER="${{ inputs.tag_name }}"
+          if [[ -z "$TAG_VER" ]]; then
+            echo "::error::tag_name is required when publish=true"
+            exit 1
+          fi
+
+          TAG_LATEST="ffmpeg-bundle-latest"
+
+          ASSET_GZ="${{ needs.build.outputs.asset_gz }}"
+          SHA_GZ="${{ needs.build.outputs.sha_gz }}"
+          META="metadata.txt"
+
+          # Fixed names for latest (stable URLs)
+          FIX_GZ="ffmpeg-bundle-linux-x86_64.tar.gz"
+          FIX_GZ_SHA="${FIX_GZ}.sha256"
+
+          cp -f "$ASSET_GZ" "$FIX_GZ"
+          sha256sum "$FIX_GZ" > "$FIX_GZ_SHA"
+
+          make_notes() {
+            local out="$1"
+            local kind="$2"
+            local tag="$3"
+            local asset1="$4"
+            local asset2="$5"
+            {
+              echo "FFmpeg bundle (BtbN mirror)."
+              echo ""
+              echo "Release kind: $kind"
+              echo "Tag: $tag"
+              echo ""
+              echo "Assets:"
+              echo "- $asset1"
+              echo "- $asset2"
+              echo "- $META"
+              echo ""
+              echo "Notes:"
+              echo "- Source: BtbN FFmpeg-Builds (master-latest linux64 gpl)."
+              echo "- Packaged as tar.gz for easy extraction."
+              echo "- Intended for Manzana auto-tooling bootstrap."
+            } > "$out"
+          }
+
+          ensure_release() {
+            local tag="$1"
+            local title="$2"
+            local notes_file="$3"
+
+            if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+              gh release edit "$tag" --repo "$GH_REPO" --title "$title" --notes-file "$notes_file"
+            else
+              gh release create "$tag" --repo "$GH_REPO" --target "$GITHUB_SHA" --title "$title" --notes-file "$notes_file"
+            fi
+          }
+
+          # --- Versioned release ---
+          NOTES_VER="${{ runner.temp }}/release-notes-versioned.txt"
+          make_notes "$NOTES_VER" "versioned" "$TAG_VER" "$ASSET_GZ" "$SHA_GZ"
+          ensure_release "$TAG_VER" "FFmpeg Bundle (${TAG_VER})" "$NOTES_VER"
+
+          gh release upload "$TAG_VER" --repo "$GH_REPO" \
+            "$ASSET_GZ" \
+            "$SHA_GZ" \
+            "$META" \
+            --clobber
+
+          # --- Latest release (stable URLs) ---
+          NOTES_LATEST="${{ runner.temp }}/release-notes-latest.txt"
+          make_notes "$NOTES_LATEST" "latest (stable URLs)" "$TAG_LATEST" "$FIX_GZ" "$FIX_GZ_SHA"
+          ensure_release "$TAG_LATEST" "FFmpeg Bundle (latest)" "$NOTES_LATEST"
+
+          gh release upload "$TAG_LATEST" --repo "$GH_REPO" \
+            "$FIX_GZ" \
+            "$FIX_GZ_SHA" \
+            "$META" \
+            --clobber
