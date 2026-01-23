@@ -1,0 +1,319 @@
+name: Build & Release MP4Box Bundle
+
+# .github/workflows/release-mp4box-bundle.yml @ v0.1.0
+#
+# Build a redistributable-ish MP4Box (GPAC) bundle and optionally publish to GitHub Releases.
+#
+# What it does:
+# - Build on ubuntu-22.04 via apt (gpac + gpac-modules-base).
+# - Bundle MP4Box + non-glibc shared libs + GPAC modules.
+# - Patch RPATH to prefer bundled libs.
+# - Package as tar.zst + sha256 + metadata.
+# - Test the bundle on ubuntu-22.04 and ubuntu-24.04.
+# - Optionally publish assets to a GitHub Release tag.
+#
+# Notes:
+# - We intentionally exclude glibc/loader libs (libc, ld-linux, libpthread, libm, libdl, librt, libresolv, libutil).
+# - The resulting bundle is primarily intended for modern Linux runners/users.
+# - For wider compatibility (e.g. glibc 2.31), move build base to older distro or build from source.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag name (e.g. mp4box-bundle-v2.0.0). Required if publish=true."
+        required: false
+        default: "mp4box-bundle-v0.1.0"
+        type: string
+      publish:
+        description: "Publish to GitHub Release (creates/updates release assets)"
+        required: true
+        default: false
+        type: boolean
+      bundle_rev:
+        description: "Bundle revision label (for filename/metadata only), e.g. 1/2/3"
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-bundle
+    runs-on: ubuntu-22.04
+    outputs:
+      asset_basename: ${{ steps.meta.outputs.asset_basename }}
+      asset_file: ${{ steps.meta.outputs.asset_file }}
+      sha_file: ${{ steps.meta.outputs.sha_file }}
+      meta_file: ${{ steps.meta.outputs.meta_file }}
+
+    steps:
+      - name: Install build deps (gpac + tools)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gpac gpac-modules-base patchelf zstd
+
+      - name: Build MP4Box bundle
+        id: meta
+        run: |
+          set -euo pipefail
+
+          MP4BOX="$(command -v MP4Box)"
+          echo "MP4Box path: $MP4BOX"
+
+          GPAC_PKG_VER="$(dpkg-query -W -f='${Version}\n' gpac || true)"
+          GPAC_PKG_VER_SAFE="$(printf '%s' "$GPAC_PKG_VER" | tr -c 'A-Za-z0-9._-+' '_' | tr '+ ' '__')"
+
+          GLIBC_VER="$(ldd --version 2>/dev/null | head -n 1 | awk '{print $NF}')"
+          ARCH="$(uname -m)"
+          UBUNTU_VER="$(. /etc/os-release && echo "$VERSION_ID")"
+
+          BUNDLE_ROOT="$RUNNER_TEMP/mp4box-bundle"
+          BIN="$BUNDLE_ROOT/bin"
+          LIB="$BUNDLE_ROOT/lib"
+          mkdir -p "$BIN" "$LIB"
+
+          cp -av "$MP4BOX" "$BIN/MP4Box.bin"
+
+          should_exclude() {
+            local base="$1"
+            case "$base" in
+              libc.so.*|ld-linux*|ld-*.so*|libpthread.so.*|libm.so.*|libdl.so.*|librt.so.*|libresolv.so.*|libutil.so.*)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          copy_lib() {
+            local p="$1"
+            [[ -z "$p" ]] && return 0
+            if [[ ! -e "$p" ]]; then
+              echo "::warning::lib not found on disk: $p"
+              return 1
+            fi
+
+            local base real real_base
+            base="$(basename "$p")"
+
+            if should_exclude "$base"; then
+              # Skip glibc/loader family libs
+              return 0
+            fi
+
+            real="$(readlink -f "$p" || true)"
+            [[ -z "$real" || ! -e "$real" ]] && real="$p"
+            real_base="$(basename "$real")"
+
+            if [[ ! -e "$LIB/$real_base" ]]; then
+              cp -av "$real" "$LIB/"
+            fi
+
+            if [[ "$base" != "$real_base" ]]; then
+              ln -sf "$real_base" "$LIB/$base"
+            fi
+
+            return 0
+          }
+
+          echo "::group::ldd MP4Box.bin (system env)"
+          ldd "$BIN/MP4Box.bin" || true
+          echo "::endgroup::"
+
+          missing=0
+          while IFS= read -r line; do
+            if echo "$line" | grep -q "not found"; then
+              echo "::error::Missing dependency: $line"
+              missing=1
+              continue
+            fi
+
+            p="$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) {print $i; exit}}')"
+            [[ -z "$p" ]] && continue
+            echo "$p" | grep -q "linux-vdso" && continue
+
+            if ! copy_lib "$p"; then
+              missing=1
+            fi
+          done < <(ldd "$BIN/MP4Box.bin" || true)
+
+          if [[ "$missing" -ne 0 ]]; then
+            echo "::error::Some dependencies were missing/unpackable."
+            exit 1
+          fi
+
+          # Bundle GPAC modules directory into $LIB/gpac
+          MOD_SRC=""
+          for d in /usr/lib/*/gpac /usr/lib/*/gpac/modules; do
+            [[ -d "$d" ]] && { MOD_SRC="$d"; break; }
+          done
+          if [[ -z "$MOD_SRC" ]]; then
+            MOD_SRC="$(dpkg -L gpac-modules-base 2>/dev/null | grep -E '/gpac(/modules)?$' | head -n 1 || true)"
+          fi
+
+          if [[ -n "$MOD_SRC" && -d "$MOD_SRC" ]]; then
+            echo "::notice::Bundling GPAC modules from: $MOD_SRC"
+            mkdir -p "$LIB/gpac"
+            cp -a "$MOD_SRC"/. "$LIB/gpac/" || true
+          else
+            echo "::warning::Could not locate GPAC modules directory to bundle."
+          fi
+
+          # Patch RPATH so MP4Box.bin can find bundled libs without LD_LIBRARY_PATH
+          patchelf --set-rpath '$ORIGIN/../lib' "$BIN/MP4Box.bin" || true
+
+          # Wrapper (kept for safety; also sets LD_LIBRARY_PATH)
+          cat > "$BIN/MP4Box" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="$DIR/../lib:${LD_LIBRARY_PATH:-}"
+          exec "$DIR/MP4Box.bin" "$@"
+          SH
+          chmod +x "$BIN/MP4Box"
+
+          # Metadata
+          META="$RUNNER_TEMP/metadata.txt"
+          {
+            echo "bundle_rev=${{ inputs.bundle_rev }}"
+            echo "build_ubuntu=${UBUNTU_VER}"
+            echo "arch=${ARCH}"
+            echo "glibc=${GLIBC_VER}"
+            echo "gpac_pkg_version=${GPAC_PKG_VER}"
+            echo "mp4box_path=${MP4BOX}"
+            echo "build_time_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > "$META"
+
+          echo "::group::bundle tree"
+          ls -la "$BIN"
+          echo "--- lib (top) ---"
+          ls -la "$LIB" | head -n 120 || true
+          echo "--- lib/gpac (top) ---"
+          ls -la "$LIB/gpac" 2>/dev/null | head -n 120 || true
+          echo "::endgroup::"
+
+          # Package
+          ASSET_BASENAME="mp4box-gpac_${GPAC_PKG_VER_SAFE}-linux_${ARCH}-ubuntu${UBUNTU_VER}-glibc${GLIBC_VER}-rev${{ inputs.bundle_rev }}"
+          ASSET_FILE="${ASSET_BASENAME}.tar.zst"
+          SHA_FILE="${ASSET_FILE}.sha256"
+
+          tar --zstd -cf "$RUNNER_TEMP/$ASSET_FILE" -C "$BUNDLE_ROOT" .
+          (cd "$RUNNER_TEMP" && sha256sum "$ASSET_FILE" > "$SHA_FILE")
+
+          # Export outputs
+          echo "asset_basename=$ASSET_BASENAME" >> "$GITHUB_OUTPUT"
+          echo "asset_file=$ASSET_FILE" >> "$GITHUB_OUTPUT"
+          echo "sha_file=$SHA_FILE" >> "$GITHUB_OUTPUT"
+          echo "meta_file=$(basename "$META")" >> "$GITHUB_OUTPUT"
+
+          # Move meta into same folder for artifact upload
+          cp -av "$META" "$RUNNER_TEMP/$(basename "$META")"
+
+      - name: Upload build artifacts (tar.zst + sha256 + metadata)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mp4box-bundle-build
+          path: |
+            ${{ runner.temp }}/${{ steps.meta.outputs.asset_file }}
+            ${{ runner.temp }}/${{ steps.meta.outputs.sha_file }}
+            ${{ runner.temp }}/${{ steps.meta.outputs.meta_file }}
+          if-no-files-found: error
+
+  test:
+    name: test-bundle-${{ matrix.os }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mp4box-bundle-build
+          path: ${{ runner.temp }}/mp4box-bundle-build
+
+      - name: Extract + run checks
+        run: |
+          set -euo pipefail
+          cd "${{ runner.temp }}/mp4box-bundle-build"
+
+          ls -la
+          sha256sum -c "${{ needs.build.outputs.sha_file }}"
+
+          mkdir -p "$HOME/.local/mp4box-bundle"
+          tar --zstd -xf "${{ needs.build.outputs.asset_file }}" -C "$HOME/.local/mp4box-bundle"
+
+          echo "$HOME/.local/mp4box-bundle/bin" >> "$GITHUB_PATH"
+          export LD_LIBRARY_PATH="$HOME/.local/mp4box-bundle/lib:${LD_LIBRARY_PATH:-}"
+
+          command -v MP4Box
+          MP4Box -version | head -n 3
+
+          echo "::group::ldd MP4Box.bin (realistic env)"
+          ldd "$HOME/.local/mp4box-bundle/bin/MP4Box.bin" | tee /tmp/ldd-mp4box.txt
+          echo "::endgroup::"
+          ! grep -q "not found" /tmp/ldd-mp4box.txt
+
+  release:
+    name: release
+    needs: [build, test]
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mp4box-bundle-build
+          path: ${{ runner.temp }}/mp4box-bundle-build
+
+      - name: Create/Update GitHub Release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "${{ runner.temp }}/mp4box-bundle-build"
+
+          TAG="${{ inputs.tag_name }}"
+          if [[ -z "$TAG" ]]; then
+            echo "::error::tag_name is required when publish=true"
+            exit 1
+          fi
+
+          TITLE="MP4Box Bundle (${TAG})"
+          BODY_FILE="${{ runner.temp }}/release-notes.txt"
+
+          {
+            echo "MP4Box (GPAC) bundle build."
+            echo ""
+            echo "Assets:"
+            echo "- ${{ needs.build.outputs.asset_file }}"
+            echo "- ${{ needs.build.outputs.sha_file }}"
+            echo "- metadata.txt"
+            echo ""
+            echo "Notes:"
+            echo "- Built on ubuntu-22.04 via apt (gpac + gpac-modules-base)."
+            echo "- Bundles MP4Box + shared libs (excluding glibc/loader) + GPAC modules."
+            echo "- Intended for use by Manzana auto-tooling bootstrap."
+          } > "$BODY_FILE"
+
+          # Create release if not exists; otherwise edit.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes-file "$BODY_FILE"
+          else
+            gh release create "$TAG" --title "$TITLE" --notes-file "$BODY_FILE"
+          fi
+
+          gh release upload "$TAG" \
+            "${{ needs.build.outputs.asset_file }}" \
+            "${{ needs.build.outputs.sha_file }}" \
+            metadata.txt \
+            --clobber
