@@ -1,24 +1,31 @@
 name: Build & Release MP4Box Bundle
 
-# .github/workflows/release-mp4box-bundle.yml @ v0.1.4
+# .github/workflows/release-mp4box-bundle.yml @ v0.1.5
 #
-# v0.1.4 changes vs v0.1.3:
-# - Fix release step failure: `gh` tried to run `git` to detect repo / HEAD tag target,
-#   but release job doesn't checkout the repo (no .git).
-# - Solution:
-#   - Use `--repo "$GITHUB_REPOSITORY"` for all gh release commands
-#   - Use `--target "$GITHUB_SHA"` when creating the release/tag
+# v0.1.5 changes vs v0.1.4:
+# - When publish=true:
+#   1) Publish a versioned release to tag_name (assets keep versioned filenames)
+#   2) ALSO publish/update a stable "latest" release/tag: mp4box-bundle-latest
+#      with FIXED asset names for permanent download URLs:
+#        - mp4box-bundle-linux-x86_64.tar.zst
+#        - mp4box-bundle-linux-x86_64.tar.zst.sha256
+#        - metadata.txt
+#
+# Notes:
+# - Build base: ubuntu-22.04 (glibc 2.35). Bundle is tested on ubuntu-22.04 and ubuntu-24.04.
+# - We intentionally exclude glibc/loader libs (libc, ld-linux, libpthread, libm, libdl, librt, libresolv, libutil).
+# - `gh` commands use explicit --repo and --target to avoid requiring a local .git checkout.
 
 on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag name (e.g. mp4box-bundle-v0.1.4-rev1). Required if publish=true."
+        description: "Versioned release tag name (e.g. mp4box-bundle-v0.1.5-rev1). Required if publish=true."
         required: false
-        default: "mp4box-bundle-v0.1.4-rev1"
+        default: "mp4box-bundle-v0.1.5-rev1"
         type: string
       publish:
-        description: "Publish to GitHub Release (creates/updates release assets)"
+        description: "Publish to GitHub Release (creates/updates release assets). Also updates mp4box-bundle-latest."
         required: true
         default: false
         type: boolean
@@ -154,8 +161,10 @@ jobs:
             echo "::warning::Could not locate GPAC modules directory to bundle."
           fi
 
+          # Prefer bundled libs without LD_LIBRARY_PATH
           patchelf --set-rpath '$ORIGIN/../lib' "$BIN/MP4Box.bin" || true
 
+          # Wrapper (kept for safety)
           cat > "$BIN/MP4Box" <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
@@ -165,6 +174,7 @@ jobs:
           SH
           chmod +x "$BIN/MP4Box"
 
+          # Metadata
           META="$RUNNER_TEMP/metadata.txt"
           {
             echo "bundle_rev=${{ inputs.bundle_rev }}"
@@ -176,6 +186,7 @@ jobs:
             echo "build_time_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           } > "$META"
 
+          # Package (versioned filename)
           ASSET_BASENAME="mp4box-gpac_${GPAC_PKG_VER_SAFE}-linux_${ARCH}-ubuntu${UBUNTU_VER}-glibc${GLIBC_VER}-rev${{ inputs.bundle_rev }}"
           ASSET_FILE="${ASSET_BASENAME}.tar.zst"
           SHA_FILE="${ASSET_FILE}.sha256"
@@ -253,7 +264,7 @@ jobs:
           name: mp4box-bundle-build
           path: ${{ runner.temp }}/mp4box-bundle-build
 
-      - name: Create/Update GitHub Release and upload assets
+      - name: Create/Update GitHub Releases (versioned + latest) and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -262,38 +273,79 @@ jobs:
           set -euo pipefail
           cd "${{ runner.temp }}/mp4box-bundle-build"
 
-          TAG="${{ inputs.tag_name }}"
-          if [[ -z "$TAG" ]]; then
+          TAG_VER="${{ inputs.tag_name }}"
+          if [[ -z "$TAG_VER" ]]; then
             echo "::error::tag_name is required when publish=true"
             exit 1
           fi
 
-          TITLE="MP4Box Bundle (${TAG})"
-          BODY_FILE="${{ runner.temp }}/release-notes.txt"
+          TAG_LATEST="mp4box-bundle-latest"
 
-          {
-            echo "MP4Box (GPAC) bundle build."
-            echo ""
-            echo "Assets:"
-            echo "- ${{ needs.build.outputs.asset_file }}"
-            echo "- ${{ needs.build.outputs.sha_file }}"
-            echo "- metadata.txt"
-            echo ""
-            echo "Notes:"
-            echo "- Built on ubuntu-22.04 via apt (gpac + gpac-modules-base)."
-            echo "- Bundles MP4Box + shared libs (excluding glibc/loader) + GPAC modules."
-            echo "- Intended for use by Manzana auto-tooling bootstrap."
-          } > "$BODY_FILE"
+          ASSET_VER="${{ needs.build.outputs.asset_file }}"
+          SHA_VER="${{ needs.build.outputs.sha_file }}"
+          META="metadata.txt"
 
-          # Use explicit repo and explicit target to avoid requiring a local git repo.
-          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
-            gh release edit "$TAG" --repo "$GH_REPO" --title "$TITLE" --notes-file "$BODY_FILE"
-          else
-            gh release create "$TAG" --repo "$GH_REPO" --target "$GITHUB_SHA" --title "$TITLE" --notes-file "$BODY_FILE"
-          fi
+          # Prepare FIXED filenames for stable latest URLs
+          FIX_ASSET="mp4box-bundle-linux-x86_64.tar.zst"
+          FIX_SHA="${FIX_ASSET}.sha256"
 
-          gh release upload "$TAG" --repo "$GH_REPO" \
-            "${{ needs.build.outputs.asset_file }}" \
-            "${{ needs.build.outputs.sha_file }}" \
-            metadata.txt \
+          cp -f "$ASSET_VER" "$FIX_ASSET"
+          sha256sum "$FIX_ASSET" > "$FIX_SHA"
+
+          make_notes() {
+            local out="$1"
+            local kind="$2"
+            local tag="$3"
+            local asset1="$4"
+            local asset2="$5"
+            {
+              echo "MP4Box (GPAC) bundle build."
+              echo ""
+              echo "Release kind: $kind"
+              echo "Tag: $tag"
+              echo ""
+              echo "Assets:"
+              echo "- $asset1"
+              echo "- $asset2"
+              echo "- $META"
+              echo ""
+              echo "Notes:"
+              echo "- Built on ubuntu-22.04 via apt (gpac + gpac-modules-base)."
+              echo "- Bundles MP4Box + shared libs (excluding glibc/loader) + GPAC modules."
+              echo "- Intended for use by Manzana auto-tooling bootstrap."
+            } > "$out"
+          }
+
+          ensure_release() {
+            local tag="$1"
+            local title="$2"
+            local notes_file="$3"
+
+            if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+              gh release edit "$tag" --repo "$GH_REPO" --title "$title" --notes-file "$notes_file"
+            else
+              gh release create "$tag" --repo "$GH_REPO" --target "$GITHUB_SHA" --title "$title" --notes-file "$notes_file"
+            fi
+          }
+
+          # --- Versioned release (immutable-ish assets) ---
+          NOTES_VER="${{ runner.temp }}/release-notes-versioned.txt"
+          make_notes "$NOTES_VER" "versioned" "$TAG_VER" "$ASSET_VER" "$SHA_VER"
+          ensure_release "$TAG_VER" "MP4Box Bundle (${TAG_VER})" "$NOTES_VER"
+
+          gh release upload "$TAG_VER" --repo "$GH_REPO" \
+            "$ASSET_VER" \
+            "$SHA_VER" \
+            "$META" \
+            --clobber
+
+          # --- Latest release (stable URLs + fixed names) ---
+          NOTES_LATEST="${{ runner.temp }}/release-notes-latest.txt"
+          make_notes "$NOTES_LATEST" "latest (stable URLs)" "$TAG_LATEST" "$FIX_ASSET" "$FIX_SHA"
+          ensure_release "$TAG_LATEST" "MP4Box Bundle (latest)" "$NOTES_LATEST"
+
+          gh release upload "$TAG_LATEST" --repo "$GH_REPO" \
+            "$FIX_ASSET" \
+            "$FIX_SHA" \
+            "$META" \
             --clobber
