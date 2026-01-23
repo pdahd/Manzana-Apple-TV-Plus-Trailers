@@ -1,18 +1,21 @@
 name: Build & Release MP4Box Bundle
 
-# .github/workflows/release-mp4box-bundle.yml @ v0.1.3
+# .github/workflows/release-mp4box-bundle.yml @ v0.1.4
 #
-# v0.1.3 changes vs v0.1.2:
-# - Fix test step failure: $GITHUB_PATH only affects subsequent steps, not current step.
-#   Export PATH inside the same step before calling `command -v MP4Box`.
+# v0.1.4 changes vs v0.1.3:
+# - Fix release step failure: `gh` tried to run `git` to detect repo / HEAD tag target,
+#   but release job doesn't checkout the repo (no .git).
+# - Solution:
+#   - Use `--repo "$GITHUB_REPOSITORY"` for all gh release commands
+#   - Use `--target "$GITHUB_SHA"` when creating the release/tag
 
 on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag name (e.g. mp4box-bundle-v2.0.0). Required if publish=true."
+        description: "Release tag name (e.g. mp4box-bundle-v0.1.4-rev1). Required if publish=true."
         required: false
-        default: "mp4box-bundle-v0.1.3"
+        default: "mp4box-bundle-v0.1.4-rev1"
         type: string
       publish:
         description: "Publish to GitHub Release (creates/updates release assets)"
@@ -173,14 +176,6 @@ jobs:
             echo "build_time_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           } > "$META"
 
-          echo "::group::bundle tree"
-          ls -la "$BIN"
-          echo "--- lib (top) ---"
-          ls -la "$LIB" | head -n 120 || true
-          echo "--- lib/gpac (top) ---"
-          ls -la "$LIB/gpac" 2>/dev/null | head -n 120 || true
-          echo "::endgroup::"
-
           ASSET_BASENAME="mp4box-gpac_${GPAC_PKG_VER_SAFE}-linux_${ARCH}-ubuntu${UBUNTU_VER}-glibc${GLIBC_VER}-rev${{ inputs.bundle_rev }}"
           ASSET_FILE="${ASSET_BASENAME}.tar.zst"
           SHA_FILE="${ASSET_FILE}.sha256"
@@ -233,11 +228,8 @@ jobs:
 
           tar --zstd -xf "${{ needs.build.outputs.asset_file }}" -C "$BUNDLE"
 
-          # IMPORTANT: $GITHUB_PATH affects subsequent steps only.
-          # Export PATH for THIS step.
           export PATH="$BUNDLE/bin:$PATH"
           echo "$BUNDLE/bin" >> "$GITHUB_PATH"
-
           export LD_LIBRARY_PATH="$BUNDLE/lib:${LD_LIBRARY_PATH:-}"
 
           command -v MP4Box
@@ -264,6 +256,8 @@ jobs:
       - name: Create/Update GitHub Release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           cd "${{ runner.temp }}/mp4box-bundle-build"
@@ -291,13 +285,14 @@ jobs:
             echo "- Intended for use by Manzana auto-tooling bootstrap."
           } > "$BODY_FILE"
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "$TITLE" --notes-file "$BODY_FILE"
+          # Use explicit repo and explicit target to avoid requiring a local git repo.
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GH_REPO" --title "$TITLE" --notes-file "$BODY_FILE"
           else
-            gh release create "$TAG" --title "$TITLE" --notes-file "$BODY_FILE"
+            gh release create "$TAG" --repo "$GH_REPO" --target "$GITHUB_SHA" --title "$TITLE" --notes-file "$BODY_FILE"
           fi
 
-          gh release upload "$TAG" \
+          gh release upload "$TAG" --repo "$GH_REPO" \
             "${{ needs.build.outputs.asset_file }}" \
             "${{ needs.build.outputs.sha_file }}" \
             metadata.txt \
