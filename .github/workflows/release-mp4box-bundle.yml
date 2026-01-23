@@ -1,12 +1,9 @@
 name: Build & Release MP4Box Bundle
 
-# .github/workflows/release-mp4box-bundle.yml @ v0.1.1
+# .github/workflows/release-mp4box-bundle.yml @ v0.1.2
 #
-# Build a redistributable-ish MP4Box (GPAC) bundle and optionally publish to GitHub Releases.
-#
-# v0.1.1 changes vs v0.1.0:
-# - Fix "tr: range-endpoints ... are in reverse collating sequence order" by replacing tr-range
-#   sanitization with LC_ALL=C + sed (safe for '-' and '+' across locales).
+# v0.1.2 changes vs v0.1.1:
+# - Fix failure: remove redundant `cp metadata.txt -> same path` (cp complained "same file").
 #
 # What it does:
 # - Build on ubuntu-22.04 via apt (gpac + gpac-modules-base).
@@ -18,7 +15,6 @@ name: Build & Release MP4Box Bundle
 #
 # Notes:
 # - We intentionally exclude glibc/loader libs (libc, ld-linux, libpthread, libm, libdl, librt, libresolv, libutil).
-# - The resulting bundle is primarily intended for modern Linux runners/users.
 # - For wider compatibility (e.g. glibc 2.31), move build base to older distro or build from source.
 
 on:
@@ -27,7 +23,7 @@ on:
       tag_name:
         description: "Release tag name (e.g. mp4box-bundle-v2.0.0). Required if publish=true."
         required: false
-        default: "mp4box-bundle-v0.1.1"
+        default: "mp4box-bundle-v0.1.2"
         type: string
       publish:
         description: "Publish to GitHub Release (creates/updates release assets)"
@@ -182,7 +178,7 @@ jobs:
           SH
           chmod +x "$BIN/MP4Box"
 
-          # Metadata
+          # Metadata (already in $RUNNER_TEMP, no need to copy)
           META="$RUNNER_TEMP/metadata.txt"
           {
             echo "bundle_rev=${{ inputs.bundle_rev }}"
@@ -215,9 +211,6 @@ jobs:
           echo "asset_file=$ASSET_FILE" >> "$GITHUB_OUTPUT"
           echo "sha_file=$SHA_FILE" >> "$GITHUB_OUTPUT"
           echo "meta_file=$(basename "$META")" >> "$GITHUB_OUTPUT"
-
-          # Move meta into same folder for artifact upload
-          cp -av "$META" "$RUNNER_TEMP/$(basename "$META")"
 
       - name: Upload build artifacts (tar.zst + sha256 + metadata)
         uses: actions/upload-artifact@v4
