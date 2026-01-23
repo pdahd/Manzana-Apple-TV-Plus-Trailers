@@ -1,8 +1,12 @@
 name: Build & Release MP4Box Bundle
 
-# .github/workflows/release-mp4box-bundle.yml @ v0.1.0
+# .github/workflows/release-mp4box-bundle.yml @ v0.1.1
 #
 # Build a redistributable-ish MP4Box (GPAC) bundle and optionally publish to GitHub Releases.
+#
+# v0.1.1 changes vs v0.1.0:
+# - Fix "tr: range-endpoints ... are in reverse collating sequence order" by replacing tr-range
+#   sanitization with LC_ALL=C + sed (safe for '-' and '+' across locales).
 #
 # What it does:
 # - Build on ubuntu-22.04 via apt (gpac + gpac-modules-base).
@@ -23,7 +27,7 @@ on:
       tag_name:
         description: "Release tag name (e.g. mp4box-bundle-v2.0.0). Required if publish=true."
         required: false
-        default: "mp4box-bundle-v0.1.0"
+        default: "mp4box-bundle-v0.1.1"
         type: string
       publish:
         description: "Publish to GitHub Release (creates/updates release assets)"
@@ -65,7 +69,8 @@ jobs:
           echo "MP4Box path: $MP4BOX"
 
           GPAC_PKG_VER="$(dpkg-query -W -f='${Version}\n' gpac || true)"
-          GPAC_PKG_VER_SAFE="$(printf '%s' "$GPAC_PKG_VER" | tr -c 'A-Za-z0-9._-+' '_' | tr '+ ' '__')"
+          # Safe filename token across locales; keep A-Za-z0-9._+- only, replace others with '_'
+          GPAC_PKG_VER_SAFE="$(printf '%s' "$GPAC_PKG_VER" | LC_ALL=C sed 's/[^A-Za-z0-9._+\-]/_/g')"
 
           GLIBC_VER="$(ldd --version 2>/dev/null | head -n 1 | awk '{print $NF}')"
           ARCH="$(uname -m)"
@@ -305,7 +310,6 @@ jobs:
             echo "- Intended for use by Manzana auto-tooling bootstrap."
           } > "$BODY_FILE"
 
-          # Create release if not exists; otherwise edit.
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --title "$TITLE" --notes-file "$BODY_FILE"
           else
