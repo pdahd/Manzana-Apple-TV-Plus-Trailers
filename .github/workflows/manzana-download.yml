@@ -1,10 +1,10 @@
 name: Manzana Download (Apple TV+ Trailers)
 
-# .github/workflows/manzana-download.yml @ v1.6.10
-# Changes vs v1.6.9:
-# - UI/UX: Add emojis + concise Chinese guidance in workflow_dispatch inputs descriptions.
-# - Validation: add a few notices/warnings to reduce mismatched selections and ambiguity.
-# - No change to core behaviors (tN->clip[N] fallback, all fallback, grouped logs, safe report names, etc.).
+# .github/workflows/manzana-download.yml @ v1.6.11
+# Changes vs v1.6.10:
+# - Runner: pin to ubuntu-22.04 for stability.
+# - Phase 2: replace apt gpac install with MP4Box(gpac) bundle cache steps (START/END marked).
+# - Fix: copy_lib() return code bug that could falsely mark missing deps.
 
 on:
   workflow_dispatch:
@@ -728,7 +728,10 @@ jobs:
           copy_lib() {
             local p="$1"
             [[ -z "$p" ]] && return 0
-            [[ ! -e "$p" ]] && return 1
+            if [[ ! -e "$p" ]]; then
+              echo "::warning::lib not found on disk: $p"
+              return 1
+            fi
 
             local base real real_base
             base="$(basename "$p")"
@@ -736,8 +739,15 @@ jobs:
             [[ -z "$real" || ! -e "$real" ]] && real="$p"
             real_base="$(basename "$real")"
 
-            [[ ! -e "$LIB/$real_base" ]] && cp -av "$real" "$LIB/"
-            [[ "$base" != "$real_base" ]] && ln -sf "$real_base" "$LIB/$base"
+            if [[ ! -e "$LIB/$real_base" ]]; then
+              cp -av "$real" "$LIB/"
+            fi
+
+            if [[ "$base" != "$real_base" ]]; then
+              ln -sf "$real_base" "$LIB/$base"
+            fi
+
+            return 0
           }
 
           missing=0
@@ -752,7 +762,9 @@ jobs:
             [[ -z "$p" ]] && continue
             echo "$p" | grep -q "linux-vdso" && continue
 
-            copy_lib "$p" || missing=1
+            if ! copy_lib "$p"; then
+              missing=1
+            fi
           done < <(ldd "$BIN/MP4Box.bin" || true)
 
           if [[ "$missing" -ne 0 ]]; then
