@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# install-manzana.sh @ v0.1.2
+# install-manzana.sh @ v0.1.3
 #
-# Key features:
-# - Install Manzana into user directory (no sudo):
-#     - APP_DIR: ~/.local/share/manzana
-#     - BIN_DIR: ~/.local/bin (wrapper command "manzana")
-# - Robust venv creation:
-#     - Try python3 -m venv (may fail if ensurepip is disabled)
-#     - Fallback to python3 -m venv --without-pip + get-pip.py
-# - Support installing a specific ref (tag/branch/commit) for reproducibility:
-#     - MANZANA_REF or --ref
+# Changes vs v0.1.2:
+# - Cleaner output by default:
+#   - pip install output is redirected to install.log
+#   - only prints high-level steps
+#   - on failure, prints tail of install.log
+# - Add MANZANA_INSTALL_VERBOSE=1 to show full pip output.
+# - Keep venv fallback: if ensurepip is missing/disabled, use --without-pip + get-pip.py (no sudo).
+#
+# Features:
+# - Install to user dir (no sudo):
+#   - APP_DIR: ~/.local/share/manzana
+#   - BIN_DIR: ~/.local/bin (wrapper "manzana")
+# - Support installing a specific ref for reproducibility:
+#   - MANZANA_REF or --ref
 # - Support uninstall:
-#     - --uninstall
-# - Optionally modify shell rc to include ~/.local/bin so user can run `manzana` directly:
-#     - default: enabled (MANZANA_MODIFY_PATH=1)
-#     - disable: MANZANA_MODIFY_PATH=0
+#   - --uninstall
+# - Optionally modify shell rc to include ~/.local/bin:
+#   - MANZANA_MODIFY_PATH=1(default), 0=disable
 
 REPO_OWNER="pdahd"
 REPO_NAME="Manzana-Apple-TV-Plus-Trailers"
@@ -30,17 +34,16 @@ BIN_DIR_DEFAULT="$HOME/.local/bin"
 APP_DIR="${MANZANA_APP_DIR:-$APP_DIR_DEFAULT}"
 BIN_DIR="${MANZANA_BIN_DIR:-$BIN_DIR_DEFAULT}"
 
-MODIFY_PATH="${MANZANA_MODIFY_PATH:-1}"   # 1=yes, 0=no
-DEBUG="${MANZANA_DEBUG:-0}"               # 1=yes, 0=no
+MODIFY_PATH="${MANZANA_MODIFY_PATH:-1}"             # 1=yes, 0=no
+VERBOSE="${MANZANA_INSTALL_VERBOSE:-0}"             # 1=yes, 0=no
+DEBUG="${MANZANA_DEBUG:-0}"                         # 1=yes, 0=no
 
 say() { printf '%s\n' "$*"; }
 die() { say "ERROR: $*"; exit 1; }
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
-
 usage() {
   cat <<EOF
-Manzana installer (v0.1.2)
+Manzana installer (v0.1.3)
 
 Usage:
   bash install-manzana.sh [--ref <ref>] [--uninstall]
@@ -50,12 +53,12 @@ Options:
   --uninstall       Uninstall (remove wrapper + app dir)
 
 Env vars:
-  MANZANA_REF            Same as --ref
-  MANZANA_APP_DIR        Default: ${APP_DIR_DEFAULT}
-  MANZANA_BIN_DIR        Default: ${BIN_DIR_DEFAULT}
-  MANZANA_MODIFY_PATH    1(default)=append PATH export to ~/.bashrc and/or ~/.zshrc, 0=do not modify rc files
-  MANZANA_DEBUG          1=print extra debug output
-
+  MANZANA_REF                 Same as --ref
+  MANZANA_APP_DIR             Default: ${APP_DIR_DEFAULT}
+  MANZANA_BIN_DIR             Default: ${BIN_DIR_DEFAULT}
+  MANZANA_MODIFY_PATH         1(default)=append PATH export to ~/.bashrc and/or ~/.zshrc, 0=do not modify rc files
+  MANZANA_INSTALL_VERBOSE     1=show full pip output, 0(default)=write to install.log
+  MANZANA_DEBUG               1=print extra debug output
 EOF
 }
 
@@ -82,10 +85,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# downloader
 if command -v curl >/dev/null 2>&1; then
-  DL_CURL="curl"
+  DL="curl"
 elif command -v wget >/dev/null 2>&1; then
-  DL_CURL="wget"
+  DL="wget"
 else
   die "Need curl or wget"
 fi
@@ -93,19 +97,10 @@ fi
 download_to() {
   local url="$1"
   local out="$2"
-  if [[ "$DL_CURL" == "curl" ]]; then
+  if [[ "$DL" == "curl" ]]; then
     curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$out"
   else
     wget -qO "$out" "$url"
-  fi
-}
-
-download_stdout() {
-  local url="$1"
-  if [[ "$DL_CURL" == "curl" ]]; then
-    curl -fsSL --retry 3 --retry-delay 2 "$url"
-  else
-    wget -qO- "$url"
   fi
 }
 
@@ -126,14 +121,13 @@ if [[ "$ACTION" == "uninstall" ]]; then
   say " - $APP_DIR"
   say ""
   say "Optional cleanup (not automatic):"
-  say " - Tool cache: ~/.cache/manzana/tools  (or MANZANA_TOOLS_DIR if you set it)"
+  say " - Tool cache: ~/.cache/manzana/tools (or MANZANA_TOOLS_DIR if you set it)"
   say " - PATH lines in ~/.bashrc / ~/.zshrc (if added)"
   exit 0
 fi
 
-need_cmd python3
+command -v python3 >/dev/null 2>&1 || die "Missing python3"
 
-# venv module required, but on some systems ensurepip is disabled.
 if ! python3 -c 'import venv' >/dev/null 2>&1; then
   die "python3 venv module not available. On Debian/Ubuntu: sudo apt-get install -y python3-venv"
 fi
@@ -142,7 +136,6 @@ TMP="$(mktemp -d)"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
-# Try refs in a robust order: tags -> heads -> commit/archive
 TARBALL_CANDIDATES=(
   "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/tags/${REF}.tar.gz"
   "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REF}.tar.gz"
@@ -153,11 +146,9 @@ say "Downloading source tarball..."
 SRC_TAR="$TMP/src.tar.gz"
 DOWNLOADED=0
 for u in "${TARBALL_CANDIDATES[@]}"; do
-  if [[ "$DEBUG" == "1" ]]; then
-    say "  trying: $u"
-  fi
+  [[ "$DEBUG" == "1" ]] && say "  trying: $u"
   if download_to "$u" "$SRC_TAR" >/dev/null 2>&1; then
-    say "  ok: $u"
+    say "ok: $u"
     DOWNLOADED=1
     break
   fi
@@ -173,10 +164,13 @@ SRC_DIR="$(find "$TMP/src" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -n 
 
 say "Installing files..."
 mkdir -p "$APP_DIR"
-rm -rf "$APP_DIR/venv" 2>/dev/null || true
-rm -rf "$APP_DIR/src" 2>/dev/null || true
+rm -rf "$APP_DIR/venv" "$APP_DIR/src" 2>/dev/null || true
 mkdir -p "$APP_DIR/src"
 cp -a "$SRC_DIR"/. "$APP_DIR/src/"
+
+INSTALL_LOG="$APP_DIR/install.log"
+mkdir -p "$APP_DIR"
+: > "$INSTALL_LOG"
 
 say "Creating virtualenv..."
 VENV_ERR="$TMP/venv.err"
@@ -186,12 +180,8 @@ VENV_RC=$?
 set -e
 
 if [[ $VENV_RC -ne 0 ]]; then
-  say "WARN: python3 -m venv failed (ensurepip may be missing/disabled). Falling back to --without-pip + get-pip.py."
-  if [[ "$DEBUG" == "1" ]]; then
-    say "--- venv stderr ---"
-    sed -n '1,120p' "$VENV_ERR" || true
-    say "--- end ---"
-  fi
+  say "INFO: venv ensurepip not available; using --without-pip + get-pip.py fallback."
+  [[ "$DEBUG" == "1" ]] && { say "--- venv stderr ---"; sed -n '1,120p' "$VENV_ERR" || true; say "--- end ---"; }
 
   rm -rf "$APP_DIR/venv" 2>/dev/null || true
   python3 -m venv --without-pip "$APP_DIR/venv"
@@ -200,16 +190,25 @@ if [[ $VENV_RC -ne 0 ]]; then
   GETPIP_URL="https://bootstrap.pypa.io/get-pip.py"
   GETPIP_PY="$TMP/get-pip.py"
   download_to "$GETPIP_URL" "$GETPIP_PY"
-  "$APP_DIR/venv/bin/python" "$GETPIP_PY" >/dev/null
+  "$APP_DIR/venv/bin/python" "$GETPIP_PY" >>"$INSTALL_LOG" 2>&1
 fi
 
-if [[ ! -x "$APP_DIR/venv/bin/python" ]]; then
-  die "venv python not found: $APP_DIR/venv/bin/python"
-fi
+[[ -x "$APP_DIR/venv/bin/python" ]] || die "venv python not found: $APP_DIR/venv/bin/python"
 
 say "Installing python deps..."
-"$APP_DIR/venv/bin/python" -m pip install --upgrade pip >/dev/null
-"$APP_DIR/venv/bin/pip" install -r "$APP_DIR/src/requirements.txt"
+if [[ "$VERBOSE" == "1" ]]; then
+  "$APP_DIR/venv/bin/python" -m pip install --upgrade pip
+  "$APP_DIR/venv/bin/pip" install -r "$APP_DIR/src/requirements.txt"
+else
+  {
+    "$APP_DIR/venv/bin/python" -m pip install --upgrade pip
+    "$APP_DIR/venv/bin/pip" install -r "$APP_DIR/src/requirements.txt"
+  } >>"$INSTALL_LOG" 2>&1 || {
+    say "ERROR: pip install failed. Showing last 80 lines of install.log:"
+    tail -n 80 "$INSTALL_LOG" || true
+    die "pip install failed (full log: $INSTALL_LOG)"
+  }
+fi
 
 say "Creating wrapper command: manzana"
 mkdir -p "$BIN_DIR"
@@ -221,29 +220,18 @@ exec "\$APP_DIR/venv/bin/python" "\$APP_DIR/src/manzana.py" "\$@"
 SH
 chmod +x "$BIN_DIR/manzana"
 
-# Modify PATH in rc files so user can run `manzana` directly
+# Modify PATH in rc files (for future shells)
 maybe_add_path_rc() {
   [[ "$MODIFY_PATH" == "1" ]] || return 0
 
-  # If already in PATH, no need to touch rc
-  case ":$PATH:" in
-    *":$HOME/.local/bin:"*) return 0 ;;
-  esac
-
   local line='export PATH="$HOME/.local/bin:$PATH"'
   local marker='# Added by Manzana installer (ensure ~/.local/bin is on PATH)'
-
-  # Prefer writing to existing rc; if none exists, create ~/.bashrc as a default.
   local targets=()
   [[ -f "$HOME/.bashrc" ]] && targets+=("$HOME/.bashrc")
   [[ -f "$HOME/.zshrc" ]] && targets+=("$HOME/.zshrc")
-
-  if [[ ${#targets[@]} -eq 0 ]]; then
-    targets+=("$HOME/.bashrc")
-  fi
+  [[ ${#targets[@]} -eq 0 ]] && targets+=("$HOME/.bashrc")
 
   for rc in "${targets[@]}"; do
-    # Avoid duplicate insert
     if [[ -f "$rc" ]] && grep -qF "$line" "$rc"; then
       continue
     fi
@@ -253,20 +241,15 @@ maybe_add_path_rc() {
       echo "$line"
     } >> "$rc"
   done
-
-  say ""
-  say "PATH update:"
-  say "  Added ~/.local/bin to PATH in: ${targets[*]}"
-  say "  Open a new terminal, or run:"
-  say "    export PATH=\"\$HOME/.local/bin:\$PATH\""
 }
 
 maybe_add_path_rc
 
 say ""
 say "== Done =="
-say "Run:"
-say "  $BIN_DIR/manzana --help"
-say ""
-say "Tip: if command not found in current shell, run:"
+say "Run (current shell):"
 say "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+say "  manzana --help"
+say ""
+say "For future shells, PATH was written to rc file(s) (if enabled)."
+say "Install log: $INSTALL_LOG"
