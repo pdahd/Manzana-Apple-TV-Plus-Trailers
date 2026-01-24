@@ -1,0 +1,114 @@
+name: Test Installer (install-manzana.sh)
+
+# .github/workflows/test-install-manzana.yml @ v0.1.0
+#
+# Purpose:
+# - CI smoke test to ensure the one-liner installer remains functional over time.
+# - Split into:
+#   (A) Offline test (runs on every push/PR): install + manzana --help
+#   (B) Network test (manual): install + manzana --list-trailers (touches tv.apple.com, may be flaky)
+#
+# Notes:
+# - This workflow does NOT download any videos.
+# - It does NOT touch your main Actions workflow (manzana-download.yml).
+# - It installs into user-space under the runner home (no sudo).
+# - For network test, you can change TEST_URL to any stable Apple TV URL.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      run_network_test:
+        description: "Run the network test (calls tv.apple.com). May be flaky."
+        required: true
+        default: false
+        type: boolean
+      test_url:
+        description: "Apple TV URL for network test (only used when run_network_test=true)"
+        required: true
+        default: "https://tv.apple.com/us/movie/f1-the-movie/umc.cmc.3t6dvnnr87zwd4wmvpdx5came?ctx_agid=502c9996"
+        type: string
+
+jobs:
+  offline:
+    name: offline-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show environment (python/curl)
+        run: |
+          set -euo pipefail
+          uname -a || true
+          cat /etc/os-release || true
+          command -v python3
+          python3 --version
+          command -v curl
+          curl --version | head -n 2
+
+      - name: Run installer (offline smoke)
+        run: |
+          set -euo pipefail
+          bash ./install-manzana.sh
+
+      - name: Verify installed manzana command (offline)
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+
+          echo "manzana location:"
+          command -v manzana
+          ls -la "$(command -v manzana)"
+
+          echo "manzana --help (head):"
+          manzana --help | head -n 25
+
+      - name: Verify venv + requirements installed (basic import check)
+        run: |
+          set -euo pipefail
+
+          VENV_PY="$HOME/.local/share/manzana/venv/bin/python"
+          test -x "$VENV_PY"
+
+          # Basic imports (should not touch network)
+          "$VENV_PY" - <<'PY'
+          import requests, aiohttp, m3u8, bs4, rich, mutagen
+          print("imports_ok")
+          PY
+
+  network:
+    name: network-${{ matrix.os }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_network_test }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run installer
+        run: |
+          set -euo pipefail
+          bash ./install-manzana.sh
+
+      - name: Run manzana --list-trailers (network test)
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          URL="${{ inputs.test_url }}"
+
+          # Avoid large downloads: list trailers only.
+          # If Apple changes or rate limits, this test may fail.
+          manzana --list-trailers "$URL"
