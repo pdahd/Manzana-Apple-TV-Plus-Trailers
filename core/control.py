@@ -25,25 +25,20 @@ from core.tagger import tagFile
 from utils import logger, sanitize
 from utils.bootstrap_tools import ensure_mp4box, ensure_ffmpeg
 
-# core/control.py @ v2.4.3
-# Changes vs v2.4.2:
-# - Add runtime bootstrap for FFmpeg (BtbN bundle mirror):
-#   - Only when subtitle tracks are selected (sN present)
-#   - If system ffmpeg meets minimal version, use it
-#   - Otherwise auto-download/use our bundled ffmpeg (ffmpeg-bundle-latest)
-# - Keep all existing interactive/non-interactive logic unchanged.
+# core/control.py @ v2.4.4
+# Changes vs v2.4.3:
+# - Improve output directory behavior for "installed CLI" usage:
+#   - If env MANZANA_INSTALL=1 (set by install script wrapper), default output dir becomes:
+#       <current working directory>/video
+#     so users can easily find downloaded files in any VM/container/dir.
+#   - If the current directory is not writable, fallback to:
+#       ~/video
+# - Print the full output path to user (Chinese-friendly hint), without changing core download logic.
 #
-# Keeps v2.4.1 policy:
-# - Fix "prefix dedup" misses caused by punctuation/fullwidth variants:
-#   Compare and cut prefix using NFKC-normalized strings + whitespace collapse.
-# - If the remaining suffix starts with parentheses/brackets, join with space instead of " - "
-#   so we get: "Movie (字幕吹替) (2014) Apple-Trailer.mp4" rather than "Movie - (字幕吹替)..."
-# - Keep v2.4.0 policy:
-#   "{MovieTitle} - {VideoTitle (dedup)} ({Year}) Apple-Trailer.mp4"
-#   Apple-Trailer always immediately before ".mp4"
-#   Auto (2)/(3)... on name collision
-#   No [WEB-DL]/[ATVP]/[t0]/[clip-...] in final delivery name
-
+# Notes:
+# - Repo/Actions behavior is unchanged: when MANZANA_INSTALL is not set,
+#   output stays under <repo_root>/output (as before).
+# - Interactive/non-interactive logic is unchanged.
 
 cons = Console()
 
@@ -55,14 +50,50 @@ def __get_path():
         return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-TEMPDIR = os.path.join(__get_path(), "temp")
-OUTPUTDIR = os.path.join(__get_path(), "output")
+def _resolve_output_dir() -> str:
+    """
+    Resolve output directory.
+    - Default (repo mode): <repo_root>/output  (keeps GitHub Actions behavior unchanged)
+    - Installed CLI mode (MANZANA_INSTALL=1): <cwd>/video (user-friendly)
+      If not writable/creatable: fallback to ~/video
+    """
+    install_mode = (os.environ.get("MANZANA_INSTALL") or "").strip() == "1"
 
-if not os.path.exists(TEMPDIR):
-    os.makedirs(TEMPDIR)
+    if install_mode:
+        # Best user experience: output to current working directory
+        out = os.path.join(os.getcwd(), "video")
+        try:
+            os.makedirs(out, exist_ok=True)
+            # quick write permission check (directory exists but may be unwritable)
+            testfile = os.path.join(out, ".manzana_write_test")
+            with open(testfile, "w") as f:
+                f.write("ok")
+            os.remove(testfile)
+            return out
+        except Exception:
+            # fallback to home
+            home_out = os.path.join(os.path.expanduser("~"), "video")
+            os.makedirs(home_out, exist_ok=True)
+            return home_out
 
-if not os.path.exists(OUTPUTDIR):
-    os.makedirs(OUTPUTDIR)
+    # repo mode (default)
+    out = os.path.join(__get_path(), "output")
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
+def _resolve_temp_dir() -> str:
+    """
+    Keep existing temp behavior to minimize risk:
+    - Use <repo_root>/temp (or install-root/src/temp) as before.
+    """
+    t = os.path.join(__get_path(), "temp")
+    os.makedirs(t, exist_ok=True)
+    return t
+
+
+TEMPDIR = _resolve_temp_dir()
+OUTPUTDIR = _resolve_output_dir()
 
 
 def _print_trailers(trailers: list):
@@ -276,12 +307,10 @@ def _select_by_format(expr: str, indexed: dict):
 
 
 def _ensure_tools(selected_tracks: list):
-    # Ensure MP4Box exists (auto-download bundle if missing/too old)
     ensure_mp4box(min_gpac_version=(2, 0))
     if not shutil.which("MP4Box"):
         logger.error('Unable to find "MP4Box" in PATH! (required for muxing)', 1)
 
-    # Ensure ffmpeg ONLY when subtitles are requested
     need_ffmpeg = any(t.get("type") == "subtitle" for t in selected_tracks)
     if need_ffmpeg:
         ensure_ffmpeg(min_ffmpeg_version=(4, 2))
@@ -290,25 +319,12 @@ def _ensure_tools(selected_tracks: list):
 
 
 def _norm_for_prefix_compare(s: str) -> str:
-    """
-    Normalize string for prefix comparison:
-    - NFKC to unify fullwidth/halfwidth punctuation (&/＆, ：/:, etc.)
-    - collapse whitespace
-    """
     s = unicodedata.normalize("NFKC", str(s or "")).strip()
     s = re.sub(r"\s+", " ", s)
     return s
 
 
 def _dedup_video_title_prefix(movie_title: str, video_title: str) -> str:
-    """
-    Remove repeated movie title prefix from video title, using NFKC-normalized comparison.
-
-    Example:
-      movie_title="X-MEN：フューチャー&パスト"
-      video_title="X-MEN：フューチャー＆パスト (字幕/吹替)"
-    => returns "(字幕/吹替)"
-    """
     mt_raw = str(movie_title or "").strip()
     vt_raw = str(video_title or "").strip()
     if not mt_raw or not vt_raw:
@@ -322,7 +338,6 @@ def _dedup_video_title_prefix(movie_title: str, video_title: str) -> str:
 
     if vt.startswith(mt):
         rest = vt[len(mt):].strip()
-        # strip common separators after prefix
         rest = rest.lstrip(" -–—:：|・･")
         rest = rest.strip()
         return rest
@@ -331,12 +346,6 @@ def _dedup_video_title_prefix(movie_title: str, video_title: str) -> str:
 
 
 def _build_delivery_basename(movie_title: str, video_title: str, year: str) -> str:
-    """
-    Build user-facing base name WITHOUT extension.
-    Must end with " Apple-Trailer" (immediately before .mp4).
-    """
-
-    # year normalize
     y = (year or "").strip()
     if not y or not re.match(r"^\d{4}$", y):
         y = "0000"
@@ -344,14 +353,9 @@ def _build_delivery_basename(movie_title: str, video_title: str, year: str) -> s
     mt_raw = str(movie_title or "").strip()
     vt_raw = str(video_title or "").strip()
 
-    # Dedup: get a "rest" (may be "(字幕/吹替)" or "ローグ・エディション (字幕/吹替)")
     rest = _dedup_video_title_prefix(mt_raw, vt_raw)
     rest = str(rest or "").strip()
 
-    # Decide join style:
-    # - If rest is empty: just movie title
-    # - If rest starts with brackets: join with space (more natural)
-    # - Else: join with " - "
     mt_disp = mt_raw
     if not mt_disp:
         mt_disp = "manzana_output"
@@ -377,10 +381,6 @@ def _build_delivery_basename(movie_title: str, video_title: str, year: str) -> s
 
 
 def _unique_output_path(base_no_ext: str, out_dir: str) -> str:
-    """
-    Ensure output filename uniqueness by appending (2), (3)... BEFORE 'Apple-Trailer'.
-    Keep 'Apple-Trailer' immediately before .mp4.
-    """
     base_no_ext = sanitize(base_no_ext)
     if not base_no_ext:
         base_no_ext = "manzana_output (0000) Apple-Trailer"
@@ -448,6 +448,7 @@ def run(args):
 
             logger.info(f'Preparing {item.get("title","")} | {item.get("videoTitle","")}')
             logger.info(f"Output file: {os.path.basename(op)}")
+            logger.info(f"输出路径: {op}")
 
             hls = get_hls(master_url)
             indexed = _index_tracks(hls)
