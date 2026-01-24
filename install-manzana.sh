@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# install-manzana.sh @ v0.1.4
+# install-manzana.sh @ v0.1.5
 #
-# Changes vs v0.1.3:
-# - Wrapper now exports MANZANA_INSTALL=1 so installed CLI defaults output dir to:
-#     当前工作目录/video  （若当前目录无写权限则回退到 ~/video）
-#   (Requires core/control.py @ v2.4.4 to be present in the installed source.)
-# - Improve user-facing messages (Chinese-friendly).
+# Changes vs v0.1.4:
+# - UX: Improve final instructions to avoid ambiguity/misleading guidance.
+#   - Detect whether `manzana` is immediately available in the CURRENT shell PATH.
+#   - If yes: print "可直接使用：manzana ..."
+#   - If no: print clear next steps:
+#       - run: export PATH="$HOME/.local/bin:$PATH"
+#       - or open a new terminal
+#       - and recommend the one-liner install form that enables immediate use:
+#           export PATH="$HOME/.local/bin:$PATH"; curl ... | bash
 #
-# Keeps v0.1.3 features:
-# - Clean output by default; pip output goes to install.log (verbose switch available)
-# - Robust venv creation: fallback to --without-pip + get-pip.py if ensurepip missing/disabled
-# - Install a specific ref (tag/branch/commit): MANZANA_REF or --ref
-# - Uninstall: --uninstall
-# - Optionally append ~/.local/bin to PATH via rc files (MANZANA_MODIFY_PATH=1 default)
+# Core behavior remains unchanged.
 
 REPO_OWNER="pdahd"
 REPO_NAME="Manzana-Apple-TV-Plus-Trailers"
@@ -37,7 +36,7 @@ die() { say "ERROR: $*"; exit 1; }
 
 usage() {
   cat <<EOF
-Manzana 安装脚本 (v0.1.4)
+Manzana 安装脚本 (v0.1.5)
 
 用法：
   bash install-manzana.sh [--ref <ref>] [--uninstall]
@@ -133,7 +132,6 @@ TMP="$(mktemp -d)"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
-# Try refs: tags -> heads -> commit/archive
 TARBALL_CANDIDATES=(
   "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/tags/${REF}.tar.gz"
   "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REF}.tar.gz"
@@ -210,7 +208,6 @@ fi
 say "生成命令：manzana"
 mkdir -p "$BIN_DIR"
 
-# IMPORTANT: mark installed CLI mode for friendly output directory behavior
 cat > "$BIN_DIR/manzana" <<SH
 #!/usr/bin/env bash
 set -euo pipefail
@@ -249,14 +246,39 @@ maybe_add_path_rc() {
 
 maybe_add_path_rc
 
+# --- Final UX: avoid misleading instructions ---
+# Determine whether manzana is available in the CURRENT shell PATH.
+# NOTE: This script runs in a subshell when used as `curl ... | bash`,
+# so it cannot change the parent shell environment. We only provide guidance.
+MANZANA_PATH_EXPECTED="$BIN_DIR/manzana"
+MANZANA_AVAILABLE_NOW=0
+if command -v manzana >/dev/null 2>&1; then
+  MANZANA_AVAILABLE_NOW=1
+else
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) MANZANA_AVAILABLE_NOW=1 ;;
+    *) MANZANA_AVAILABLE_NOW=0 ;;
+  esac
+fi
+
 say ""
 say "== 安装完成 =="
-say "当前终端立即使用："
-say "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-say "  manzana --help"
-say ""
 say "安装版默认输出目录："
 say "  当前目录/video   （若当前目录无写权限则回退到 ~/video）"
-say ""
-say "提示：已尝试写入 rc 文件（~/.bashrc 或 ~/.zshrc）以便以后新开终端自动生效。"
 say "安装日志：$INSTALL_LOG"
+say ""
+
+if [[ "$MANZANA_AVAILABLE_NOW" -eq 1 ]]; then
+  say "当前终端已可直接使用："
+  say "  manzana --help"
+else
+  say "当前终端可能还无法直接找到命令（这是 shell 机制导致的正常现象）。"
+  say "你可以选择其一："
+  say "  A) 立即在当前终端启用："
+  say "     export PATH=\"\$HOME/.local/bin:\$PATH\""
+  say "  B) 重新打开一个终端（或 source ~/.bashrc / ~/.zshrc）"
+  say ""
+  say "推荐的一键安装（安装后立刻可用）："
+  say "  export PATH=\"\$HOME/.local/bin:\$PATH\"; curl -fsSL \\"
+  say "    https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/install-manzana.sh | bash"
+fi
