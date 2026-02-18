@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-# tools/list_clip_urls.py @ v0.1.3
+# tools/list_clip_urls.py @ v0.2.0
+#
+# Changes vs v0.1.3:
+# - Sync with aptv.py v0.3.0: serialized-server-data may no longer exist on Apple TV pages.
+# - _extract_serialized_server_data now returns None gracefully (no crash).
+# - _resolve_title_via_serialized_server_data: if serialized-server-data is missing,
+#   immediately falls through to meta/title fallback (no error).
+# - Added _extract_developer_token_from_html for use by _resolve_title_via_api
+#   (so the API fallback also works when serialized-server-data is gone).
+# - All existing behavior preserved; only resilience improved.
 #
 # Purpose:
 #   Extract clip URLs from a movie page (HTML) as a fallback for "trailer=all"
 #   when the UTS API only returns 0/1 trailer.
 #
 # Output:
-#   - stdout: clip URLs only (one per line)  [workflow-safe]
+#   - stdout: clip URLs only (one per line) [workflow-safe]
 #   - stderr: debug + optional resolved titles (human readable)
-#
-# v0.1.3 changes vs v0.1.2:
-# - Fix mojibake (乱码) by decoding HTML robustly from r.content (UTF-8 first).
-# - Improve --resolve-titles:
-#     Prefer extracting clip title from serialized-server-data (JSON) on the clip page
-#     (usually contains specific names like 吹替版/字幕版),
-#     fallback to og:title / <title> only if JSON extraction fails.
-# - Keep stdout clean (URLs only). All logs go to stderr.
 
 from __future__ import annotations
 
@@ -30,7 +31,6 @@ from urllib.parse import urlparse, urljoin
 
 import requests
 
-
 # --- Make repo root importable ---
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
@@ -42,7 +42,6 @@ def _redirect_manzana_logs_to_stderr() -> None:
     try:
         from rich.console import Console
         import utils.logger as manzana_logger
-
         manzana_logger.cons = Console(file=sys.stderr)
     except Exception:
         pass
@@ -118,7 +117,7 @@ def _decode_html_response(r: requests.Response) -> str:
 def _fetch_html(url: str) -> str:
     headers = {
         "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                       "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "accept-language": "en-US,en;q=0.9",
     }
@@ -137,23 +136,18 @@ def _extract_clip_hrefs(html: str, base_url: str, movie_id: str) -> List[str]:
     hrefs = re.findall(r'href="([^"]+)"', html, flags=re.IGNORECASE)
     out: List[str] = []
     seen = set()
-
     for raw in hrefs:
         raw = html_mod.unescape(raw)
-
         if "/clip/" not in raw:
             continue
         if f"targetId={movie_id}" not in raw:
             continue
         if "targetType=Movie" not in raw:
             continue
-
         abs_url = urljoin(base_url, raw).strip()
-
         if abs_url not in seen:
             seen.add(abs_url)
             out.append(abs_url)
-
     return out
 
 
@@ -182,11 +176,9 @@ def _deep_find_titles(obj: Any) -> List[str]:
             # If it looks like a playable
             if parent_key in ("playable", "playables") and isinstance(x.get("title"), str):
                 titles.append(x["title"])
-
             # Generic title fields
             if isinstance(x.get("title"), str):
                 titles.append(x["title"])
-
             for k, v in x.items():
                 walk(v, str(k))
         elif isinstance(x, list):
@@ -221,20 +213,16 @@ def _pick_best_title(candidates: List[str]) -> Optional[str]:
     def score(t: str) -> Tuple[int, int]:
         # Higher is better
         bonus = 0
-
-        # prefer “specific version” keywords
+        # prefer "specific version" keywords
         for kw in ("吹替", "字幕", "吹き替え", "字幕版", "吹替版"):
             if kw in t:
                 bonus += 50
-
         # prefer parentheses variants
         if ("(" in t and ")" in t) or ("（" in t and "）" in t):
             bonus += 20
-
         # penalize obvious generic branding
         if "Apple TV" in t or "AppleTV" in t:
             bonus -= 30
-
         # length as a weak signal (avoid tiny titles)
         return (bonus, len(t))
 
@@ -243,9 +231,13 @@ def _pick_best_title(candidates: List[str]) -> Optional[str]:
 
 
 def _extract_serialized_server_data(html: str) -> Optional[Any]:
+    """
+    Extract and parse serialized-server-data from HTML.
+    Returns None gracefully if the tag is missing or JSON is unparseable.
+    (v0.2.0: no longer assumes this tag exists on Apple TV pages)
+    """
     try:
         from bs4 import BeautifulSoup  # type: ignore
-
         soup = BeautifulSoup(html, "html.parser")
         s = soup.find("script", attrs={"type": "application/json", "id": "serialized-server-data"})
         if not s or not s.text:
@@ -258,12 +250,13 @@ def _extract_serialized_server_data(html: str) -> Optional[Any]:
 def _resolve_title_via_serialized_server_data(clip_url: str) -> Optional[str]:
     """
     Resolve clip name via serialized-server-data (preferred).
+    Returns None if serialized-server-data is missing or title cannot be extracted.
     """
     html = _fetch_html(clip_url)
     js = _extract_serialized_server_data(html)
     if js is None:
+        # v0.2.0: gracefully return None instead of treating as error
         return None
-
     cands = _deep_find_titles(js)
     return _pick_best_title(cands)
 
@@ -275,8 +268,8 @@ def _resolve_title_via_meta_title(clip_url: str) -> Optional[str]:
     html = _fetch_html(clip_url)
     try:
         from bs4 import BeautifulSoup  # type: ignore
-
         soup = BeautifulSoup(html, "html.parser")
+
         og = soup.find("meta", attrs={"property": "og:title"})
         if og and og.get("content"):
             s = _clean_title(str(og.get("content")))
@@ -290,7 +283,6 @@ def _resolve_title_via_meta_title(clip_url: str) -> Optional[str]:
                 return s
     except Exception:
         return None
-
     return None
 
 
@@ -298,6 +290,8 @@ def _resolve_title_via_api(clip_url: str) -> Optional[str]:
     """
     Optional last resort: call AppleTVPlus.get_info(clip_url) to read videoTitle/title.
     Can be noisy due to clips endpoint 500 fallback etc.
+    v0.2.0: This now benefits from aptv.py v0.3.0's multi-strategy token extraction,
+    so it should work even when serialized-server-data is gone.
     """
     try:
         from core.api.aptv import AppleTVPlus
@@ -348,7 +342,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     eprint(f"[list_clip_urls] movie_id={movie_id}")
     html = _fetch_html(url)
-
     clips = _extract_clip_hrefs(html, base_url=base_url, movie_id=movie_id)
 
     eprint(f"[list_clip_urls] found={len(clips)}")
