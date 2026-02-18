@@ -1,8 +1,9 @@
 import json
+import re
+import base64
 import requests
 import datetime
 import warnings
-
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 
@@ -19,18 +20,30 @@ HEADERS = {
     "user-agent": "AppleTV6,2/11.1",
 }
 
-# core/api/aptv.py @ v0.2.1
+# core/api/aptv.py @ v0.3.0
 #
-# Goals:
-# - Storefront-aware developerToken and API context:
-#   - Extract storefront from input URL path (e.g. /be/movie/... -> "be")
-#   - Fetch developerToken from https://tv.apple.com/<storefront>
-#   - Try to derive sf (storeFrontId) and locale from serialized-server-data / HTML
-#   - Use derived sf/locale for UTS requests (instead of always US context)
+# Changes vs v0.2.1:
+# - CRITICAL FIX: Apple changed tv.apple.com page structure around Feb 2025.
+#   developerToken is no longer reliably at
+#     server_data[0]["data"]["configureParams"]["developerToken"]
+#   and/or the serialized-server-data script tag may be removed entirely.
 #
-# - Keep v0.2.0 improvements:
+# - __get_access_token now uses a 6-strategy fallback chain to extract
+#   the developerToken (JWT) from the page HTML:
+#     1. Original JSON path in serialized-server-data
+#     2. Deep recursive search in serialized-server-data JSON
+#     3. Meta tag content search
+#     4. Script tag JS assignment search (developerToken/devToken)
+#     5. URL parameter search (devToken=eyJ... in fetch-proxy URLs)
+#     6. Broad JWT regex on entire HTML with header validation
+#
+# - Also extracts serialized-server-data more defensively for sf/locale
+#   (no longer fatal if missing).
+#
+# - Keeps all v0.2.1 improvements:
+#   - Storefront-aware token/API context
 #   - targetId/targetType support for clip URLs
-#   - diagnostics for non-JSON responses (status/content-type/body snippet)
+#   - diagnostics for non-JSON responses
 #   - playables fallback when clips endpoint fails
 
 
@@ -63,6 +76,101 @@ def _as_int(x):
         return None
 
 
+def _is_valid_jwt(token: str) -> bool:
+    """
+    Basic JWT validation: decode header, check it has 'alg' field.
+    """
+    if not token or "." not in token:
+        return False
+    try:
+        header_b64 = token.split(".")[0]
+        # Add padding
+        header_b64 += "=" * (4 - len(header_b64) % 4)
+        header_json = base64.urlsafe_b64decode(header_b64)
+        header = json.loads(header_json)
+        return "alg" in header
+    except Exception:
+        return False
+
+
+# JWT regex pattern: three base64url segments separated by dots
+_JWT_PATTERN = re.compile(
+    r'(eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})'
+)
+
+
+def _extract_token_from_serialized_server_data_original(server_data) -> str | None:
+    """Strategy 1: Original JSON path."""
+    try:
+        token = server_data[0]["data"]["configureParams"]["developerToken"]
+        if isinstance(token, str) and token.startswith("eyJ") and len(token) > 100:
+            return token
+    except Exception:
+        pass
+    return None
+
+
+def _extract_token_from_serialized_server_data_deep(server_data) -> str | None:
+    """Strategy 2: Deep recursive search for 'developerToken' key in JSON."""
+    return _deep_find_first(
+        server_data,
+        lambda k, v: str(k) == "developerToken"
+        and isinstance(v, str)
+        and v.startswith("eyJ")
+        and len(v) > 100,
+    )
+
+
+def _extract_token_from_meta_tags(soup) -> str | None:
+    """Strategy 3: Search meta tag content for JWT tokens."""
+    for meta in soup.find_all("meta"):
+        content = meta.get("content") or ""
+        if "eyJ" not in content or len(content) < 50:
+            continue
+        jwt_match = _JWT_PATTERN.search(content)
+        if jwt_match and _is_valid_jwt(jwt_match.group(1)):
+            return jwt_match.group(1)
+    return None
+
+
+def _extract_token_from_script_tags(soup) -> str | None:
+    """Strategy 4: Search script tag JS for developerToken/devToken assignments."""
+    pattern = re.compile(
+        r'(?:developerToken|devToken|"developerToken"|"devToken")'
+        r'[\s:="\']+'
+        r'(eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})'
+    )
+    for script in soup.find_all("script"):
+        script_text = script.string or ""
+        if not script_text or "eyJ" not in script_text:
+            continue
+        jwt_match = pattern.search(script_text)
+        if jwt_match and _is_valid_jwt(jwt_match.group(1)):
+            return jwt_match.group(1)
+    return None
+
+
+def _extract_token_from_url_params(html: str) -> str | None:
+    """Strategy 5: Search for devToken=eyJ... in URL parameters (fetch-proxy pattern)."""
+    pattern = re.compile(
+        r'devToken=(eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})'
+    )
+    jwt_match = pattern.search(html)
+    if jwt_match and _is_valid_jwt(jwt_match.group(1)):
+        return jwt_match.group(1)
+    return None
+
+
+def _extract_token_broad_jwt_search(html: str) -> str | None:
+    """Strategy 6: Broad regex search for any JWT in entire HTML, with header validation."""
+    jwt_match = _JWT_PATTERN.search(html)
+    if jwt_match:
+        candidate = jwt_match.group(1)
+        if _is_valid_jwt(candidate):
+            return candidate
+    return None
+
+
 class AppleTVPlus:
     def __init__(self):
         self.session = requests.Session()
@@ -87,12 +195,12 @@ class AppleTVPlus:
 
     def __get_access_token(self, storefront: str):
         """
-        Fetch developerToken from https://tv.apple.com/<storefront> (NOT fixed to /us).
+        Fetch developerToken from https://tv.apple.com/<storefront>.
+        Uses a 6-strategy fallback chain to handle Apple page structure changes.
         Also tries to derive sf/locale from the page JSON/HTML.
         """
         storefront = (storefront or "us").strip().lower()
         home_url = f"https://tv.apple.com/{storefront}"
-
         logger.info(f"Fetching access-token from web... (storefront={storefront})")
 
         try:
@@ -117,58 +225,114 @@ class AppleTVPlus:
         except Exception:
             lang = ""
 
-        # Find serialized-server-data
+        # --- Parse serialized-server-data (no longer fatal if missing) ---
+        server_data = None
         m = soup.find("script", attrs={"type": "application/json", "id": "serialized-server-data"})
-        if not m or not m.text:
-            logger.error('Unable to locate "serialized-server-data" on Apple TV home page.', 1)
+        if m and m.text:
+            try:
+                server_data = json.loads(m.text)
+            except Exception:
+                logger.warning("serialized-server-data found but JSON parse failed.")
+                server_data = None
+        else:
+            logger.warning(
+                'serialized-server-data script tag not found on page. '
+                'Apple may have changed page structure. Trying alternative token extraction...'
+            )
 
-        try:
-            server_data = json.loads(m.text)
-        except Exception as e:
-            logger.error(f"Unable to parse serialized-server-data JSON: {e}", 1)
+        # --- 6-strategy token extraction ---
+        accessToken = None
+        strategy_used = None
 
-        # developerToken location (same as original)
-        try:
-            accessToken = server_data[0]["data"]["configureParams"]["developerToken"]
-        except Exception:
-            logger.error("Unable to extract developerToken from serialized-server-data.", 1)
+        # Strategy 1: Original JSON path
+        if server_data and not accessToken:
+            accessToken = _extract_token_from_serialized_server_data_original(server_data)
+            if accessToken:
+                strategy_used = "1-original-json-path"
 
+        # Strategy 2: Deep search in serialized-server-data
+        if server_data and not accessToken:
+            accessToken = _extract_token_from_serialized_server_data_deep(server_data)
+            if accessToken:
+                strategy_used = "2-deep-json-search"
+
+        # Strategy 3: Meta tags
+        if not accessToken:
+            accessToken = _extract_token_from_meta_tags(soup)
+            if accessToken:
+                strategy_used = "3-meta-tags"
+
+        # Strategy 4: Script tag JS assignments
+        if not accessToken:
+            accessToken = _extract_token_from_script_tags(soup)
+            if accessToken:
+                strategy_used = "4-script-tags"
+
+        # Strategy 5: URL parameter (devToken=eyJ... in fetch-proxy)
+        if not accessToken:
+            accessToken = _extract_token_from_url_params(html)
+            if accessToken:
+                strategy_used = "5-url-param-devToken"
+
+        # Strategy 6: Broad JWT search with validation
+        if not accessToken:
+            accessToken = _extract_token_broad_jwt_search(html)
+            if accessToken:
+                strategy_used = "6-broad-jwt-search"
+
+        if not accessToken:
+            logger.error(
+                "Unable to extract developerToken from Apple TV page. "
+                "Apple may have changed the page structure. "
+                "All 6 extraction strategies failed. "
+                f"Page length={len(html)} chars, "
+                f"serialized-server-data={'found' if server_data else 'NOT found'}.",
+                1,
+            )
+
+        logger.info(f"developerToken extracted via strategy: {strategy_used}")
         self.session.headers.update({"authorization": f"Bearer {accessToken}"})
         self._token_storefront = storefront
 
-        # Try derive storeFrontId (sf) from JSON
-        sf_val = _deep_find_first(
-            server_data,
-            lambda k, v: str(k).lower() in ("storefrontid", "storefrontid", "storefront", "storefront-id", "sf")
-            and _as_int(v) is not None
-            and 100000 <= int(v) <= 999999,
-        )
-        sf_int = _as_int(sf_val)
+        # --- Derive storeFrontId (sf) from JSON (best-effort) ---
+        sf_int = None
+        if server_data:
+            sf_val = _deep_find_first(
+                server_data,
+                lambda k, v: str(k).lower() in (
+                    "storefrontid", "storefrontid", "storefront",
+                    "storefront-id", "sf"
+                )
+                and _as_int(v) is not None
+                and 100000 <= int(v) <= 999999,
+            )
+            sf_int = _as_int(sf_val)
 
         # Known fallback mapping (best-effort)
         sf_fallback_map = {
             "us": 143441,
-            "be": 143446,  # common iTunes storefront id for Belgium
-            "gb": 143444,  # (best-effort; may vary)
-            "fr": 143442,  # (best-effort; may vary)
-            "de": 143443,  # (best-effort; may vary)
+            "be": 143446,
+            "gb": 143444,
+            "fr": 143442,
+            "de": 143443,
         }
 
         if sf_int:
             self.sf = sf_int
         else:
-            # fallback by storefront code, else default to US sf
             self.sf = sf_fallback_map.get(storefront, 143441)
 
         # Locale: prefer html lang if it looks like xx-YY, else keep en-US
         if lang and ("-" in lang) and (len(lang) >= 4):
             self.locale = lang
         else:
-            # Try to find a locale-like value in JSON
-            loc_val = _deep_find_first(
-                server_data,
-                lambda k, v: str(k).lower() == "locale" and isinstance(v, str) and "-" in v and len(v) >= 4,
-            )
+            loc_val = None
+            if server_data:
+                loc_val = _deep_find_first(
+                    server_data,
+                    lambda k, v: str(k).lower() == "locale"
+                    and isinstance(v, str) and "-" in v and len(v) >= 4,
+                )
             self.locale = str(loc_val) if isinstance(loc_val, str) else "en-US"
 
         logger.info(f"Storefront context: storefront={storefront} sf={self.sf} locale={self.locale}")
@@ -192,7 +356,6 @@ class AppleTVPlus:
 
     def __get_url(self, url):
         logger.info("Checking and parsing url...")
-
         u = urlparse(url)
 
         if not u.scheme:
@@ -270,6 +433,7 @@ class AppleTVPlus:
             r = self.session.get(url=apiUrl, params=params, verify=False)
 
         ct = (r.headers.get("content-type") or "").lower()
+
         if r.status_code != 200:
             snippet = (r.text or "").replace("\n", " ")[:200]
             logger.warning(
@@ -370,7 +534,6 @@ class AppleTVPlus:
         )
 
         dataList = []
-
         if backgroundVideos:
             for item in backgroundVideos:
                 try:
@@ -403,7 +566,6 @@ class AppleTVPlus:
         Best-effort clip/playable parser. Returns a single item with an hlsUrl.
         Also tries to enrich title/releaseDate/genres/description from targetId (Movie) when present.
         """
-
         def fixdate(date_ms):
             try:
                 return datetime.datetime.utcfromtimestamp(date_ms / 1000.0).strftime("%Y-%m-%d")
@@ -462,12 +624,10 @@ class AppleTVPlus:
         coverImage = None
         if isinstance(playable, dict):
             videoTitle = playable.get("title") or ""
-
             cm = playable.get("canonicalMetadata") or {}
             img = (cm.get("images") or {}).get("contentImage") or None
             if isinstance(img, dict):
                 coverImage = img_from_obj(img)
-
             if not coverImage:
                 img2 = (playable.get("images") or {}).get("contentImage") or None
                 if isinstance(img2, dict):
